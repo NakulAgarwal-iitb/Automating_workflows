@@ -1,0 +1,15 @@
+2026/03/04-17:57:13.519 ab0b21 Reusing MANIFEST /Users/nakulagarwal/Desktop/learning/scraping /.bms_profile/Default/Local Storage/leveldb/MANIFEST-000001
+2026/03/04-17:57:13.522 ab0b21 Recovering log #267
+2026/03/04-17:57:13.522 ab0b21 Reusing old log /Users/nakulagarwal/Desktop/learning/scraping /.bms_profile/Default/Local Storage/leveldb/000267.log 
+2026/03/04-18:17:17.343 ab0b21 Level-0 table #271: started
+2026/03/04-18:17:17.355 ab0b21 Level-0 table #271: 63339 bytes OK
+2026/03/04-18:17:17.360 ab0b21 Delete type=0 #267
+2026/03/04-18:17:17.369 ab0b21 Compacting 4@0 + 1@1 files
+2026/03/04-18:17:17.372 ab0b21 Generated table #272@0: 20 keys, 43332 bytes
+2026/03/04-18:17:17.372 ab0b21 Compacted 4@0 + 1@1 files => 43332 bytes
+2026/03/04-18:17:17.374 ab0b21 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/03/04-18:17:17.374 ab0b21 Delete type=2 #261
+2026/03/04-18:17:17.374 ab0b21 Delete type=2 #263
+2026/03/04-18:17:17.374 ab0b21 Delete type=2 #271
+2026/03/04-18:17:17.374 ab0b21 Delete type=2 #265
+2026/03/04-18:17:17.374 ab0b21 Delete type=2 #268
