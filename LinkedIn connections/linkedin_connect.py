@@ -13,6 +13,10 @@ How it works:
     1. Launches Chrome with your profile (with remote debugging so it doesn't conflict)
     2. Opens the URL you give
     3. Finds all "Connect" buttons and sends personalized connection requests
+
+to kill:
+pkill -f "remote-debugging-port=9222"
+
 """
 
 import time
