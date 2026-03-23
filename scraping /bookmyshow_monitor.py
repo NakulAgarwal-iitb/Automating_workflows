@@ -9,10 +9,14 @@ Checks for "Book Now" button, clicks it when it appears.
 """
 
 import time, random, threading, subprocess, sys, os, requests
+from datetime import datetime
 
 # ── CONFIG ──
-BMS_URL = "https://in.bookmyshow.com/sports/icc-men-s-t20-world-cup-2026-semi-final-2/ET00474271"
-CHECK_INTERVAL = 15  # seconds between checks
+BMS_URL = "https://in.bookmyshow.com/sports/mumbai-indians-vs-royal-challengers-bengaluru/ET00491196?data=groupPage"
+CHECK_INTERVAL = 15  # seconds between checks (normal)
+FAST_CHECK_INTERVAL = 3  # seconds between checks (around event time)
+EVENT_HOUR = 18  # 6 PM in 24-hour format
+FAST_MODE_WINDOW = 1  # minutes before/after event time to use fast polling
 
 # ── iPHONE NOTIFICATION (ntfy.sh) ──
 # 1. Install "ntfy" app on iPhone from App Store
@@ -33,6 +37,18 @@ def play_alarm():
 
 def stop_alarm():
     _alarm_stop.set()
+
+
+def get_check_interval():
+    """Return shorter interval when close to event time (6 PM)."""
+    now = datetime.now()
+    event_minute = EVENT_HOUR * 60  # 6 PM = 1080 minutes from midnight
+    current_minute = now.hour * 60 + now.minute
+
+    # Check if within the fast-polling window
+    if abs(current_minute - event_minute) <= FAST_MODE_WINDOW:
+        return FAST_CHECK_INTERVAL
+    return CHECK_INTERVAL
 
 
 def send_iphone_notification(message):
@@ -95,7 +111,7 @@ def run():
         Stealth().apply_stealth_sync(page)
 
         print(f"🔍 Monitoring: {BMS_URL}")
-        print(f"   Checking every ~{CHECK_INTERVAL}s\n")
+        print(f"   Normal: every ~{CHECK_INTERVAL}s | Fast mode (5:50-6:10 PM): every ~{FAST_CHECK_INTERVAL}s\n")
 
         page.goto(BMS_URL, wait_until="domcontentloaded", timeout=30000)
         time.sleep(4)
@@ -172,12 +188,15 @@ def run():
                     except Exception:
                         body_text = ""
 
+                    interval = get_check_interval()
+                    mode = "⚡FAST" if interval == FAST_CHECK_INTERVAL else ""
+
                     if "coming soon" in body_text:
-                        print(f"[{now}] #{check}: Coming Soon")
+                        print(f"[{now}] #{check}: Coming Soon {mode}")
                     elif "sold out" in body_text:
-                        print(f"[{now}] #{check}: Sold Out")
+                        print(f"[{now}] #{check}: Sold Out {mode}")
                     else:
-                        print(f"[{now}] #{check}: No 'Book Now' found yet")
+                        print(f"[{now}] #{check}: No 'Book Now' found yet {mode}")
 
             except KeyboardInterrupt:
                 print("\nStopped.")
@@ -185,7 +204,8 @@ def run():
             except Exception as e:
                 print(f"[{now}] Error: {e}")
 
-            time.sleep(CHECK_INTERVAL + random.uniform(-3, 3))
+            interval = get_check_interval()
+            time.sleep(interval + random.uniform(-1, 1))
 
         browser.close()
 
