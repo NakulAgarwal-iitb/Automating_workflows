@@ -250,7 +250,29 @@ def main():
 
     try:
         driver.get(args.url)
+        print(f"📄 Opening: {args.url}")
         time.sleep(5)
+
+        # Check if logged in
+        if "login" in driver.current_url or "authwall" in driver.current_url:
+            print("\n⚠️  You need to log in to LinkedIn first!")
+            print("   A Chrome window has opened. Please log in there.")
+            print("   After logging in, re-run this script with the same command.")
+            input("\n   Press Enter to exit...")
+            return
+
+        # Wait robustly for page content
+        print("⏳ Waiting for people cards to load...")
+        try:
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'search-results-container')] | //ul[contains(@class, 'reusable-search__entity-result-list')]"))
+            )
+            print("✅ Page content loaded.")
+        except TimeoutException:
+            print("⚠️  Timed out waiting for search results container. Trying anyway...")
+        
+        # Give React another moment to render the buttons inside the containers
+        time.sleep(3)
 
         sent = 0
         skipped = 0
