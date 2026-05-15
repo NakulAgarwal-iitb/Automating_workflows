@@ -262,6 +262,50 @@ def human_delay():
     time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
 
+def _scroll_load_more(driver, pause=2.5):
+    """
+    Scroll down one screen and click "Show more results" if present.
+    Returns True if new content likely loaded (page got taller or button
+    was found and clicked), False otherwise.
+
+    Used by the via-profile loop to fetch more candidates when the
+    initially-visible set runs out.
+    """
+    try:
+        last_height = driver.execute_script("return document.body.scrollHeight")
+    except Exception:  # noqa: BLE001
+        last_height = 0
+
+    try:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    except Exception:  # noqa: BLE001
+        pass
+    time.sleep(pause)
+
+    clicked_more = False
+    try:
+        show_more = driver.find_element(
+            By.XPATH, "//button[contains(., 'Show more results')]"
+        )
+        if show_more.is_displayed():
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", show_more
+            )
+            time.sleep(0.4)
+            driver.execute_script("arguments[0].click();", show_more)
+            clicked_more = True
+            time.sleep(pause)
+    except NoSuchElementException:
+        pass
+
+    try:
+        new_height = driver.execute_script("return document.body.scrollHeight")
+    except Exception:  # noqa: BLE001
+        new_height = last_height
+
+    return clicked_more or new_height > last_height
+
+
 def scroll_to_bottom(driver, needed=None):
     """Scroll down to load people cards. Stops early if we already have enough Connect buttons."""
     max_scroll_attempts = 15
@@ -1136,8 +1180,10 @@ def main():
         "--max-profile",
         type=int,
         default=20,
-        help="Max profiles to process via the rule-based profile flow "
-             "(default: 20).",
+        help="TARGET number of successful sends via the profile flow "
+             "(default: 20). If some profiles get skipped, the script "
+             "automatically scrolls for more candidates and keeps trying "
+             "until this many sends succeed (or a 3× safety cap is hit).",
     )
     parser.add_argument(
         "--agent-fallback",
@@ -1264,50 +1310,103 @@ def main():
         profile_remaining = []  # profiles that even the rule flow couldn't connect
 
         if use_via_profile:
-            profile_targets = find_profiles_without_connect(driver)
+            target_sent = args.max_profile
+            attempts_cap = max(target_sent * 3, target_sent + 10)
+            initial_targets = find_profiles_without_connect(driver)
 
-            if not profile_targets:
+            if not initial_targets:
                 print("\nℹ️  No profiles found that need the profile-page flow.")
+            elif args.dry_run:
+                # In dry-run we just preview the first `target_sent` candidates
+                # that are visible right now. We don't actually scroll for more.
+                preview = initial_targets[:target_sent]
+                print(
+                    f"\n🔎 Found {len(initial_targets)} profiles without inline Connect "
+                    f"(showing first {len(preview)} for dry run; target is {target_sent} successful sends)."
+                )
+                print("\n🔍 DRY RUN — profile-flow targets that WOULD be processed:\n")
+                for i, (url, name) in enumerate(preview, 1):
+                    note = args.note.format(name=name)
+                    truncated = ""
+                    if len(note) > 300:
+                        note = note[:297] + "..."
+                        truncated = " (truncated to 300 chars)"
+                    print(f"   [{i}] {name}")
+                    print(f"       URL  : {url}")
+                    print(f"       Note{truncated}:")
+                    for line in note.splitlines() or [note]:
+                        print(f"         │ {line}")
+                    print(
+                        "       Will: open URL → click More → click Connect → "
+                        "click Add a note → type the above note → click Send → "
+                        "return to People page"
+                    )
+                    print()
             else:
-                if len(profile_targets) > args.max_profile:
-                    print(
-                        f"\n🔎 Found {len(profile_targets)} profiles without inline Connect; "
-                        f"capping at --max-profile={args.max_profile}."
-                    )
-                    profile_targets = profile_targets[: args.max_profile]
-                else:
-                    print(
-                        f"\n🔎 Found {len(profile_targets)} profiles without inline Connect."
-                    )
+                print(
+                    f"\n🛠️  Running rule-based profile flow — target: {target_sent} "
+                    f"successful sends (safety cap: {attempts_cap} attempts)...\n"
+                )
 
-                if args.dry_run:
-                    print("\n🔍 DRY RUN — profile-flow targets that WOULD be processed:\n")
-                    for i, (url, name) in enumerate(profile_targets, 1):
-                        note = args.note.format(name=name)
-                        truncated = ""
-                        if len(note) > 300:
-                            note = note[:297] + "..."
-                            truncated = " (truncated to 300 chars)"
-                        print(f"   [{i}] {name}")
-                        print(f"       URL  : {url}")
-                        print(f"       Note{truncated}:")
-                        for line in note.splitlines() or [note]:
-                            print(f"         │ {line}")
+                p_sent = 0
+                p_skipped = 0
+                attempts = 0
+                attempted_urls = set()
+                scroll_failures = 0
+
+                while p_sent < target_sent and attempts < attempts_cap:
+                    # Make sure we're on the People page before scanning.
+                    try:
+                        cur = driver.current_url.split("?")[0].rstrip("/")
+                        want = args.url.split("?")[0].rstrip("/")
+                        if cur != want:
+                            driver.get(args.url)
+                            time.sleep(2)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                    candidates = find_profiles_without_connect(driver)
+                    fresh = [
+                        (u, n) for u, n in candidates if u not in attempted_urls
+                    ]
+
+                    if not fresh:
+                        # Out of unseen candidates → try to scroll for more.
+                        if scroll_failures >= 3:
+                            print(
+                                f"\nℹ️  No more profiles loadable after "
+                                f"{scroll_failures} scroll attempts. "
+                                f"Stopping at {p_sent}/{target_sent} sent."
+                            )
+                            break
+                        remaining = target_sent - p_sent
                         print(
-                            "       Will: open URL → click More → click Connect → "
-                            "click Add a note → type the above note → click Send → "
-                            "return to People page"
+                            f"\n📜 Need {remaining} more sends — "
+                            f"loading additional profiles..."
                         )
-                        print()
-                else:
-                    p_sent = 0
-                    p_skipped = 0
-                    print(
-                        f"\n🛠️  Running rule-based profile flow over "
-                        f"{len(profile_targets)} profiles (no API costs)...\n"
-                    )
-                    for i, (url, name) in enumerate(profile_targets, 1):
-                        print(f"   [{i}/{len(profile_targets)}] {name}  →  {url}")
+                        if _scroll_load_more(driver):
+                            scroll_failures = 0
+                        else:
+                            scroll_failures += 1
+                            print(
+                                f"   (page didn't grow — attempt "
+                                f"{scroll_failures}/3)"
+                            )
+                        continue
+
+                    scroll_failures = 0
+                    for url, name in fresh:
+                        if p_sent >= target_sent:
+                            break
+                        if attempts >= attempts_cap:
+                            break
+
+                        attempts += 1
+                        attempted_urls.add(url)
+                        print(
+                            f"   [attempt {attempts}] {name}  →  {url}  "
+                            f"(sent {p_sent}/{target_sent})"
+                        )
                         ok = send_connection_via_profile(
                             driver,
                             url,
@@ -1317,20 +1416,29 @@ def main():
                         )
                         if ok:
                             p_sent += 1
-                            print(f"      ✅ Sent.")
+                            print(f"      ✅ Sent.  ({p_sent}/{target_sent})")
                         else:
                             p_skipped += 1
                             profile_remaining.append((url, name))
-                            print(f"      ⏭️  Skipped (will retry via agent if --agent-fallback).")
+                            print(
+                                f"      ⏭️  Skipped — will load another to "
+                                f"compensate (still need {target_sent - p_sent})."
+                            )
                         human_delay()
 
-                    print(f"\n{'='*50}")
+                if p_sent < target_sent and attempts >= attempts_cap:
                     print(
-                        f"Profile flow — Sent: {p_sent}   "
-                        f"⏭️  Skipped: {p_skipped}   "
-                        f"Total: {len(profile_targets)}"
+                        f"\n🛑 Hit safety cap of {attempts_cap} attempts. "
+                        f"Stopping at {p_sent}/{target_sent} sent."
                     )
-                    print(f"{'='*50}")
+
+                print(f"\n{'='*50}")
+                print(
+                    f"Profile flow — Sent: {p_sent}/{target_sent}   "
+                    f"⏭️  Skipped: {p_skipped}   "
+                    f"Total attempts: {attempts}"
+                )
+                print(f"{'='*50}")
 
         # ── Agent fallback for profiles without an inline Connect button ──
         # If the rule-based profile flow already ran, the agent only retries
