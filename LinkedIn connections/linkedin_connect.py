@@ -641,41 +641,165 @@ def _click_with_fallback(driver, element):
         return False
 
 
-def _find_more_button(driver):
-    """Find the 'More' button in the profile action bar.
+def _describe_button(el):
+    """Return a short, human-readable description of a button for logging."""
+    try:
+        aria = el.get_attribute("aria-label") or ""
+        text = " ".join((el.text or "").split())[:60]
+        cls = (el.get_attribute("class") or "")[:80]
+        try:
+            rect = el.rect
+            pos = f"y={int(rect.get('y', 0))} h={int(rect.get('height', 0))}"
+        except Exception:  # noqa: BLE001
+            pos = ""
+        return f"text={text!r} aria-label={aria!r} {pos} class={cls!r}"
+    except StaleElementReferenceException:
+        return "<stale>"
 
-    Profile pages have MULTIPLE buttons labelled "More" (activity, experience,
-    education sections all have their own). We need the one in the top
-    action bar, next to Message/Follow. Strategy: prefer aria-label exact
-    matches first, then fall back to siblings of the Message button.
+
+def _find_action_bar(driver):
     """
-    strategies = (
-        # Most reliable: explicit aria-label on the action-bar More button.
+    Locate the profile action-bar container by anchoring on the Message
+    or Follow button (which only exist in the action bar at the top of
+    a profile), then walking UP to find the smallest ancestor that ALSO
+    contains a 'More' button. That ancestor is the action bar.
+
+    This avoids matching the "Show more activity" / "More" buttons that
+    appear elsewhere on the profile page.
+    """
+    anchors = driver.find_elements(
+        By.XPATH,
+        "//main//button[normalize-space()='Message' "
+        "or normalize-space()='Follow' "
+        "or contains(@aria-label, 'Message ') "
+        "or contains(@aria-label, 'Follow ')]",
+    )
+    for anchor in anchors:
+        try:
+            if not anchor.is_displayed():
+                continue
+            parent = anchor
+            # Walk up at most ~10 levels looking for an ancestor that holds
+            # a "More" button alongside the anchor.
+            for _ in range(10):
+                try:
+                    parent = parent.find_element(By.XPATH, "./..")
+                except NoSuchElementException:
+                    break
+                if (parent.tag_name or "").lower() == "body":
+                    break
+                mores = parent.find_elements(
+                    By.XPATH,
+                    ".//button[normalize-space()='More' "
+                    "or @aria-label='More' "
+                    "or contains(@aria-label, 'More actions')]",
+                )
+                visible_mores = []
+                for m in mores:
+                    try:
+                        if m.is_displayed() and m.is_enabled():
+                            visible_mores.append(m)
+                    except StaleElementReferenceException:
+                        continue
+                if visible_mores:
+                    return parent, visible_mores
+        except StaleElementReferenceException:
+            continue
+    return None, []
+
+
+def _find_more_button(driver, verbose=False):
+    """Find the action-bar "More" button on a profile page.
+
+    Strategy (in order of preference):
+      1. The Message/Follow-anchored action-bar container — only "More"
+         buttons inside that container are real candidates.
+      2. Explicit aria-label matches ("More actions", "More actions, ...").
+      3. As a last resort, any visible "More" button in <main>, but only
+         if its vertical position is in the top half of the page (action
+         bars live near the top).
+    """
+    # Strategy 1: anchor on the action-bar container.
+    action_bar, action_bar_mores = _find_action_bar(driver)
+    if action_bar_mores:
+        chosen = action_bar_mores[0]
+        if verbose:
+            print(
+                f"      🎯 More-button candidates inside action bar: "
+                f"{len(action_bar_mores)}. Picking first: {_describe_button(chosen)}"
+            )
+        return chosen
+
+    # Strategy 2: explicit aria-label.
+    for xp in (
         "//button[@aria-label='More actions']",
         "//button[starts-with(@aria-label, 'More actions')]",
         "//button[contains(@aria-label, 'More actions, distance')]",
-        # Sibling of Message/Follow (action bar layout).
-        "//button[normalize-space()='Message']/following::button[normalize-space()='More'][1]",
-        "//button[normalize-space()='Follow']/following::button[normalize-space()='More'][1]",
-        "//button[contains(@aria-label, 'Message')]/following::button[normalize-space()='More'][1]",
-        # Inside the top profile card.
-        "//section[contains(@class, 'pv-top-card')]//button[normalize-space()='More']",
-        "//section[contains(@class, 'pv-top-card')]//button[contains(@aria-label, 'More')]",
-        "//div[contains(@class, 'pv-top-card')]//button[normalize-space()='More']",
-        "//*[contains(@class, 'pvs-profile-actions')]//button[normalize-space()='More']",
-        # Generic — last resort.
-        "//main//button[@aria-label='More']",
-        "//main//button[normalize-space()='More']",
-        "//main//button[.//span[normalize-space()='More']]",
-    )
-    for xp in strategies:
+    ):
         for cand in driver.find_elements(By.XPATH, xp):
             try:
                 if cand.is_displayed() and cand.is_enabled():
+                    if verbose:
+                        print(
+                            f"      🎯 Found via aria-label: "
+                            f"{_describe_button(cand)}"
+                        )
                     return cand
             except StaleElementReferenceException:
                 continue
+
+    # Strategy 3: top-of-page "More" button.
+    try:
+        viewport_h = driver.execute_script("return window.innerHeight;") or 800
+    except Exception:  # noqa: BLE001
+        viewport_h = 800
+    candidates = driver.find_elements(
+        By.XPATH,
+        "//main//button[normalize-space()='More' "
+        "or @aria-label='More' "
+        "or .//span[normalize-space()='More']]",
+    )
+    for cand in candidates:
+        try:
+            if not (cand.is_displayed() and cand.is_enabled()):
+                continue
+            rect = cand.rect
+            # Only accept if button is in the upper ~60% of the viewport.
+            if rect.get("y", 0) < viewport_h * 0.6:
+                if verbose:
+                    print(
+                        f"      🎯 Fallback top-of-page match: "
+                        f"{_describe_button(cand)}"
+                    )
+                return cand
+        except StaleElementReferenceException:
+            continue
     return None
+
+
+def _dump_more_buttons(driver):
+    """Print all visible More-ish buttons we can see, for debugging."""
+    print("      🔍 All visible 'More' candidates on the page:")
+    seen = []
+    for xp in (
+        "//button[normalize-space()='More']",
+        "//button[@aria-label='More']",
+        "//button[contains(@aria-label, 'More actions')]",
+        "//button[.//span[normalize-space()='More']]",
+    ):
+        for cand in driver.find_elements(By.XPATH, xp):
+            try:
+                if not cand.is_displayed():
+                    continue
+                key = (cand.location.get("y"), cand.text or "", cand.get_attribute("aria-label") or "")
+                if key in seen:
+                    continue
+                seen.append(key)
+                print(f"         - {_describe_button(cand)}")
+            except StaleElementReferenceException:
+                continue
+    if not seen:
+        print("         (none found)")
 
 
 def _wait_for_open_dropdown(driver, timeout=6.0):
@@ -835,20 +959,41 @@ def send_connection_via_profile(
 
         # 2) Otherwise open the More menu and find Connect inside it.
         if not connect_opened:
-            more_btn = _find_more_button(driver)
+            more_btn = _find_more_button(driver, verbose=True)
             if more_btn is None:
                 print(f"      ⚠️  No 'More' button on {name}'s profile.")
+                _dump_more_buttons(driver)
                 return False
 
             print(f"      → Clicking 'More' button…")
             if not _click_with_fallback(driver, more_btn):
                 print(f"      ⚠️  Could not click 'More' for {name}.")
+                _dump_more_buttons(driver)
                 return False
 
             # Wait for the dropdown to actually appear before searching.
             dropdown = _wait_for_open_dropdown(driver, timeout=6.0)
             if dropdown is None:
                 print(f"      ⚠️  'More' clicked but dropdown didn't open for {name}.")
+                _dump_more_buttons(driver)
+                # Also list any dropdown-like elements that ARE on the page,
+                # in case our open-dropdown detection is too strict.
+                hints = driver.find_elements(
+                    By.XPATH,
+                    "//*[contains(@class, 'dropdown') and not(contains(@style, 'display: none'))]",
+                )
+                visible_dropdowns = []
+                for h in hints[:15]:
+                    try:
+                        if h.is_displayed():
+                            cls = (h.get_attribute("class") or "")[:90]
+                            visible_dropdowns.append(cls)
+                    except StaleElementReferenceException:
+                        continue
+                if visible_dropdowns:
+                    print(f"      🔍 Visible elements with 'dropdown' in class:")
+                    for d in visible_dropdowns:
+                        print(f"         - class={d!r}")
                 return False
 
             connect_item = _find_connect_in_dropdown(driver)

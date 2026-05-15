@@ -1,0 +1,5 @@
+selenium>=4.6
+
+# Optional — only required if you use --agent-fallback / --agent-only.
+# browser-use brings in Playwright + an Anthropic client.
+browser-use>=0.1.0
