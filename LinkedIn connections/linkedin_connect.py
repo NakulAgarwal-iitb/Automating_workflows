@@ -43,10 +43,11 @@ from selenium.common.exceptions import (
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
 
 NOTE_TEMPLATE = (
-    "Hi {name}! I'm exploring future farming. Nakul here, an Emergent "
-    "Ventures fellow. Being in India, US ops are a blind spot. I'm curious "
-    "to know about the workflow of farms, and your on-the-ground expertise "
-    "would be huge to learn from. Open to a quick chat or online meet?"
+    "Hi {name}! I'm exploring agri equipment's future. Nakul here, a "
+    "final-year IITB student. In academia, practical industry insight "
+    "is a blind spot. I'm curious about new machinery development and "
+    "vision. Your John Deere expertise would be huge to learn from! "
+    "Quick call or online meet?"
 )
 
 # Delay range (seconds) between each connection request to appear human-like
@@ -137,7 +138,13 @@ def _kill_chrome_on_debug_port(port):
 
 
 def _spawn_chrome(url):
-    """Spawn a fresh Chrome process with our automation profile."""
+    """Spawn a fresh Chrome process with our automation profile.
+
+    The flags after the basics matter for headless-style automation:
+    they stop Chrome from pausing JS / animations when the tab is not
+    in the foreground, which used to break the LinkedIn More-menu
+    dropdown when the user switched away to a different tab/window.
+    """
     os.makedirs(AUTOMATION_PROFILE_DIR, exist_ok=True)
     subprocess.Popen(
         [
@@ -147,6 +154,13 @@ def _spawn_chrome(url):
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-blink-features=AutomationControlled",
+            # Keep the tab running at full speed even when backgrounded —
+            # LinkedIn's dropdowns animate in via requestAnimationFrame,
+            # which Chrome pauses on hidden tabs by default.
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
             url,
         ],
         stdout=subprocess.DEVNULL,
@@ -965,6 +979,14 @@ def send_connection_via_profile(
                 _dump_more_buttons(driver)
                 return False
 
+            # Best-effort: make sure the window is focused (so Chrome
+            # doesn't suppress animations) and that we're scrolled to the
+            # action bar.
+            try:
+                driver.execute_script("window.focus();")
+            except Exception:  # noqa: BLE001
+                pass
+
             print(f"      → Clicking 'More' button…")
             if not _click_with_fallback(driver, more_btn):
                 print(f"      ⚠️  Could not click 'More' for {name}.")
@@ -973,6 +995,21 @@ def send_connection_via_profile(
 
             # Wait for the dropdown to actually appear before searching.
             dropdown = _wait_for_open_dropdown(driver, timeout=6.0)
+
+            # Retry once: sometimes Chrome's first click reaches the page
+            # before the dropdown's JS handler is fully bound (esp. right
+            # after profile-page load).
+            if dropdown is None:
+                print(f"      ↻ No dropdown yet — retrying click once…")
+                time.sleep(1.0)
+                try:
+                    fresh = _find_more_button(driver, verbose=False)
+                except Exception:  # noqa: BLE001
+                    fresh = None
+                if fresh is not None:
+                    _click_with_fallback(driver, fresh)
+                    dropdown = _wait_for_open_dropdown(driver, timeout=6.0)
+
             if dropdown is None:
                 print(f"      ⚠️  'More' clicked but dropdown didn't open for {name}.")
                 _dump_more_buttons(driver)
