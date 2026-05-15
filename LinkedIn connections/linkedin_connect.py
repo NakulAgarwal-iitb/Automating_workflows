@@ -19,6 +19,7 @@ pkill -f "remote-debugging-port=9222"
 
 """
 
+import asyncio
 import time
 import random
 import argparse
@@ -42,10 +43,10 @@ from selenium.common.exceptions import (
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
 
 NOTE_TEMPLATE = (
-    "Hi {name}, We're alumni of IITB Driverless Racing team and are looking to "
-    "develop driverless trucks for logistics in India. We want an industry "
-    "perspective on it. Your help can make all the difference. We can get on a "
-    "call at your convenience. Thanks!"
+    "Hi {name}! I'm exploring future farming. Nakul here, an Emergent "
+    "Ventures fellow. Being in India, US ops are a blind spot. I'm curious "
+    "to know about the workflow of farms, and your on-the-ground expertise "
+    "would be huge to learn from. Open to a quick chat or online meet?"
 )
 
 # Delay range (seconds) between each connection request to appear human-like
@@ -72,19 +73,72 @@ def is_port_open(port):
     return result == 0
 
 
-def launch_chrome(url):
+def _chrome_pages(port, timeout=2.0):
     """
-    Launch a fresh Chrome instance with remote debugging.
-    Uses a separate profile directory so it never conflicts with your normal Chrome.
-    On first run, it will open LinkedIn — you log in once, and it remembers you.
-    """
-    if is_port_open(DEBUG_PORT):
-        print(f"✅ Chrome automation instance already running on port {DEBUG_PORT}.")
-        return
+    Return the list of page targets Chrome is exposing via CDP, or None
+    if Chrome isn't responding to the debugging endpoint at all.
 
-    print(f"🚀 Launching Chrome...")
+    Note: an empty list means Chrome is alive but has zero tabs — that's
+    the state `browser-use` leaves it in after a session reset, and it's
+    why ChromeDriver throws "unable to discover open pages".
+    """
+    import urllib.request
+    import json
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/json", timeout=timeout
+        ) as resp:
+            data = json.loads(resp.read().decode())
+        return [p for p in data if p.get("type") == "page"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _chrome_open_new_tab(port, url, timeout=5.0):
+    """Open a new tab in the running Chrome via CDP. Returns True on success."""
+    import urllib.request
+    try:
+        # Encoded URL must be passed as a path segment to /json/new.
+        from urllib.parse import quote
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/json/new?{quote(url, safe='')}",
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except Exception:  # noqa: BLE001
+        # Older Chrome versions accept GET on /json/new.
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/json/new?{url}", timeout=timeout
+            ) as resp:
+                return 200 <= resp.status < 300
+        except Exception:  # noqa: BLE001
+            return False
+
+
+def _kill_chrome_on_debug_port(port):
+    """Kill any Chrome process bound to the given remote-debugging port."""
+    try:
+        subprocess.run(
+            ["pkill", "-f", f"remote-debugging-port={port}"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Give the OS a moment to release the port.
+        for _ in range(10):
+            time.sleep(0.5)
+            if not is_port_open(port):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def _spawn_chrome(url):
+    """Spawn a fresh Chrome process with our automation profile."""
     os.makedirs(AUTOMATION_PROFILE_DIR, exist_ok=True)
-
     subprocess.Popen(
         [
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -99,22 +153,94 @@ def launch_chrome(url):
         stderr=subprocess.DEVNULL,
     )
 
-    # Wait for Chrome to start
-    for i in range(20):
+
+def launch_chrome(url):
+    """
+    Ensure a Chrome instance is running with remote debugging AND at least
+    one page open. Handles three states:
+
+      1. Nothing on port 9222 → spawn Chrome.
+      2. Port open + CDP responsive + ≥1 page → attach.
+      3. Port open but CDP unresponsive OR zero pages (the state
+         `browser-use` leaves behind after a session reset) → open a new
+         tab via CDP, or as a last resort kill+respawn.
+    """
+    if is_port_open(DEBUG_PORT):
+        pages = _chrome_pages(DEBUG_PORT)
+
+        if pages is None:
+            print(
+                f"⚠️  Port {DEBUG_PORT} is open but Chrome isn't responding. "
+                "Killing the zombie and relaunching..."
+            )
+            _kill_chrome_on_debug_port(DEBUG_PORT)
+        elif len(pages) == 0:
+            print(
+                f"⚠️  Chrome on port {DEBUG_PORT} has 0 open pages "
+                "(probably left over from a browser-use session). "
+                "Opening a new tab..."
+            )
+            if _chrome_open_new_tab(DEBUG_PORT, url):
+                # Give the new tab a moment to register with CDP.
+                for _ in range(10):
+                    time.sleep(0.5)
+                    pages = _chrome_pages(DEBUG_PORT) or []
+                    if pages:
+                        print("✅ New tab opened — Chrome is ready.")
+                        return
+            print(
+                "⚠️  Couldn't open a new tab via CDP. Killing and relaunching..."
+            )
+            _kill_chrome_on_debug_port(DEBUG_PORT)
+        else:
+            print(
+                f"✅ Chrome automation instance already running on port "
+                f"{DEBUG_PORT} ({len(pages)} page(s) open)."
+            )
+            return
+
+    print("🚀 Launching Chrome...")
+    _spawn_chrome(url)
+
+    # Wait for Chrome to start AND expose at least one page.
+    for _ in range(25):
         time.sleep(1)
         if is_port_open(DEBUG_PORT):
-            print("✅ Chrome is ready.")
-            return
-    print("❌ Chrome didn't start in time. Try closing any existing Chrome windows and retry.")
+            pages = _chrome_pages(DEBUG_PORT) or []
+            if pages:
+                print("✅ Chrome is ready.")
+                return
+    print(
+        "❌ Chrome didn't start cleanly. Run "
+        f"`pkill -f 'remote-debugging-port={DEBUG_PORT}'` and try again."
+    )
     sys.exit(1)
 
 
 def get_chrome_driver():
-    """Connect to the running Chrome instance via remote debugging."""
+    """Connect to the running Chrome instance via remote debugging.
+
+    Wraps the ChromeDriver init with a helpful message if Chrome is in a
+    bad state (no pages, zombie process) so the user knows what to do.
+    """
     opts = Options()
     opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{DEBUG_PORT}")
-    driver = webdriver.Chrome(options=opts)
-    return driver
+    try:
+        return webdriver.Chrome(options=opts)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if "unable to discover open pages" in msg or "cannot connect to chrome" in msg:
+            print(
+                "\n❌ ChromeDriver couldn't attach to Chrome on port "
+                f"{DEBUG_PORT}.\n"
+                "   This usually happens when `browser-use` closed all tabs "
+                "during cleanup.\n"
+                "   Run:\n"
+                f"     pkill -f 'remote-debugging-port={DEBUG_PORT}'\n"
+                "   then re-run the script. (The new launch_chrome() should "
+                "auto-recover, but a hard kill always works.)"
+            )
+        raise
 
 
 def human_delay():
@@ -212,6 +338,244 @@ def find_connect_buttons_and_names(driver):
     return results
 
 
+def _first_name_from_url(profile_url):
+    """
+    Extract a best-guess first name from a LinkedIn profile slug.
+
+    LinkedIn slugs look like:
+        /in/vineet-gautam-46040018
+        /in/sameer-mannava-76251b1a0
+        /in/john-doe
+    We take the first token, drop trailing digits/IDs.
+    """
+    try:
+        slug = profile_url.rstrip("/").split("/in/")[-1]
+        slug = slug.split("?")[0]
+        first_token = slug.split("-")[0]
+        # Drop trailing digits and underscores.
+        cleaned = "".join(ch for ch in first_token if ch.isalpha())
+        if cleaned and len(cleaned) >= 2:
+            return cleaned.title()
+    except Exception:  # noqa: BLE001
+        pass
+    return "there"
+
+
+def _looks_like_real_name(name):
+    """Heuristic: reject things that obviously aren't a first name."""
+    if not name or len(name) < 2:
+        return False
+    bad_tokens = {
+        "linkedin", "member", "more", "follow", "message", "connect",
+        "pending", "view", "open", "3rd", "2nd", "1st", "premium",
+        "dole",  # observed in the wild as a badge artifact
+    }
+    if name.lower() in bad_tokens:
+        return False
+    # Must be mostly alphabetic.
+    alpha = sum(1 for c in name if c.isalpha())
+    return alpha >= max(2, int(len(name) * 0.7))
+
+
+def _extract_first_name(card, link, profile_url):
+    """Pick a believable first name for a person. Falls back to the URL slug."""
+    candidates = []
+
+    title_selectors = (
+        "div.artdeco-entity-lockup__title",
+        "span.artdeco-entity-lockup__title",
+        "div.org-people-profile-card__profile-title",
+        "span.org-people-profile-card__profile-title",
+        "div.discover-person-card__name",
+        "span.discover-person-card__name",
+        ".entity-result__title-text",
+        ".profile-card-name",
+    )
+    for sel in title_selectors:
+        try:
+            el = card.find_element(By.CSS_SELECTOR, sel)
+            candidates.append(el.text.strip())
+        except NoSuchElementException:
+            pass
+
+    # The profile link's aria-label is usually "View <Full Name>'s profile".
+    aria = (link.get_attribute("aria-label") or "").strip()
+    if aria:
+        cleaned = aria
+        for prefix in ("View ", "Open "):
+            if cleaned.lower().startswith(prefix.lower()):
+                cleaned = cleaned[len(prefix):]
+        for suffix in ("'s profile", "’s profile"):
+            if cleaned.lower().endswith(suffix.lower()):
+                cleaned = cleaned[: -len(suffix)]
+        candidates.append(cleaned.strip())
+
+    candidates.append(link.text.strip())
+
+    for text in candidates:
+        if not text:
+            continue
+        if text.lower().startswith("linkedin member"):
+            continue
+        token = text.split()[0]
+        # Strip trailing ellipsis / punctuation from truncated names like
+        # "Sydney" (from "Sydney (Burlis...") or "Damián" (from "Damián Sanch...").
+        token = token.rstrip(".…(),")
+        if _looks_like_real_name(token):
+            return token.title()
+
+    return _first_name_from_url(profile_url)
+
+
+def find_profiles_without_connect(driver):
+    """
+    Find people on the page who DON'T have an inline "Connect" button and
+    aren't already "Pending". These get handed to the LLM agent.
+
+    Robust to multiple page sections (e.g. "Employees" + "People you may
+    know") because we walk every /in/ profile link and find its card-ish
+    ancestor, rather than betting on one card-class selector.
+
+    Returns list of (profile_url, first_name), deduped by profile URL.
+    """
+    by_url = {}  # url -> {"first_name": str, "has_connect": bool}
+
+    # Every visible profile link on the page.
+    profile_links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/in/']")
+
+    for link in profile_links:
+        try:
+            href = (link.get_attribute("href") or "").strip()
+            if "/in/" not in href:
+                continue
+            # Strip query params and trailing slash for stable dedup.
+            href = href.split("?")[0].rstrip("/")
+
+            # Find the nearest "card-ish" ancestor. We try common shapes;
+            # first match wins. Doesn't matter which section the card is in.
+            card = None
+            for xp in (
+                "./ancestor::li[1]",
+                "./ancestor::section[1]",
+                "./ancestor::div[contains(@class, 'card') "
+                "or contains(@class, 'lockup') "
+                "or contains(@class, 'entity-result')][1]",
+            ):
+                try:
+                    card = link.find_element(By.XPATH, xp)
+                    break
+                except NoSuchElementException:
+                    continue
+            if card is None:
+                continue
+
+            # Heuristic: a real people card has at least one action button
+            # (Connect / Message / Follow / Pending). Skips nav-bar profile
+            # links, mentions in posts, etc.
+            if not card.find_elements(By.TAG_NAME, "button"):
+                continue
+
+            has_connect_btn = bool(card.find_elements(
+                By.XPATH,
+                ".//button[contains(@aria-label, 'Invite') "
+                "and contains(@aria-label, 'to connect')]",
+            ))
+            is_pending = bool(card.find_elements(
+                By.XPATH,
+                ".//button[contains(@aria-label, 'Pending')] "
+                "| .//button[normalize-space()='Pending']",
+            ))
+
+            if has_connect_btn:
+                # Mark as handled by the inline Selenium flow so we never
+                # add them to the agent queue even if they appear twice.
+                by_url[href] = {"first_name": "", "has_connect": True}
+                continue
+            if is_pending:
+                continue
+
+            existing = by_url.get(href)
+            if existing is None:
+                first_name = _extract_first_name(card, link, href)
+                by_url[href] = {"first_name": first_name, "has_connect": False}
+            # If we already saw this URL elsewhere as agent-eligible, keep it.
+        except StaleElementReferenceException:
+            continue
+
+    return [
+        (url, info["first_name"])
+        for url, info in by_url.items()
+        if not info["has_connect"]
+    ]
+
+
+def _fill_and_send_connect_modal(driver, name, personalized_note):
+    """
+    Run the shared "Add a note → type → Send" flow once a Connect dialog
+    has been opened. Returns True on Send-clicked, False otherwise.
+    Caller is responsible for dismissing leftover modals on False.
+    """
+    add_note_clicked = False
+    try:
+        add_note_btn = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//button[contains(@aria-label, 'Add a note')]")
+            )
+        )
+        add_note_btn.click()
+        time.sleep(1)
+        add_note_clicked = True
+    except TimeoutException:
+        try:
+            add_note_btn = driver.find_element(
+                By.XPATH, "//button[contains(., 'Add a note')]"
+            )
+            add_note_btn.click()
+            time.sleep(1)
+            add_note_clicked = True
+        except NoSuchElementException:
+            print(
+                f"  ⚠️  Could not find 'Add a note' button for {name}. "
+                "Sending without note."
+            )
+
+    if add_note_clicked:
+        try:
+            note_field = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    "textarea[name='message'], textarea#custom-message, "
+                    "textarea.connect-button-send-invite__custom-message",
+                ))
+            )
+            note_field.clear()
+            for char in personalized_note:
+                note_field.send_keys(char)
+                time.sleep(random.uniform(0.01, 0.04))
+            time.sleep(0.5)
+        except TimeoutException:
+            print(f"  ⚠️  Could not find note text area for {name}.")
+            return False
+
+    try:
+        send_btn = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((
+                By.XPATH,
+                "//button[contains(@aria-label, 'Send invitation')]"
+                " | //button[contains(@aria-label, 'Send now')]"
+                " | //button[contains(@aria-label, 'Send without a note')]"
+                " | //button[contains(@aria-label, 'Send')]"
+                " | //button[contains(., 'Send')]",
+            ))
+        )
+        send_btn.click()
+        time.sleep(1)
+        return True
+    except TimeoutException:
+        print(f"  ⚠️  Could not find Send button for {name}.")
+        return False
+
+
 def send_connection_request(driver, button, name, note_template):
     """Click Connect, add a personalized note, and send."""
     personalized_note = note_template.format(name=name)
@@ -229,75 +593,10 @@ def send_connection_request(driver, button, name, note_template):
         driver.execute_script("arguments[0].click();", button)
         time.sleep(1.5)
 
-        # --- Handle the modal/popup ---
-        # Click "Add a note" button
-        try:
-            add_note_btn = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH, "//button[contains(@aria-label, 'Add a note')]")
-                )
-            )
-            add_note_btn.click()
-            time.sleep(1)
-        except TimeoutException:
-            # Sometimes the "Add a note" button text is different
-            try:
-                add_note_btn = driver.find_element(
-                    By.XPATH, "//button[contains(., 'Add a note')]"
-                )
-                add_note_btn.click()
-                time.sleep(1)
-            except NoSuchElementException:
-                print(f"  ⚠️  Could not find 'Add a note' button for {name}. Sending without note.")
-                # Try to just click Send
-                try:
-                    send_btn = driver.find_element(
-                        By.XPATH,
-                        "//button[contains(@aria-label, 'Send')]"
-                        " | //button[contains(@aria-label, 'Send without a note')]"
-                        " | //button[contains(., 'Send')]"
-                    )
-                    send_btn.click()
-                    return True
-                except NoSuchElementException:
-                    return False
-
-        # Type the note
-        try:
-            note_field = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "textarea[name='message'], textarea#custom-message, textarea.connect-button-send-invite__custom-message")
-                )
-            )
-            note_field.clear()
-            # Type character by character for a more human-like feel
-            for char in personalized_note:
-                note_field.send_keys(char)
-                time.sleep(random.uniform(0.01, 0.04))
-            time.sleep(0.5)
-        except TimeoutException:
-            print(f"  ⚠️  Could not find note text area for {name}.")
-            # Dismiss modal
+        ok = _fill_and_send_connect_modal(driver, name, personalized_note)
+        if not ok:
             _dismiss_modal(driver)
-            return False
-
-        # Click "Send" button
-        try:
-            send_btn = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable(
-                    (By.XPATH,
-                     "//button[contains(@aria-label, 'Send invitation')]"
-                     " | //button[contains(@aria-label, 'Send now')]"
-                     " | //button[contains(., 'Send')]")
-                )
-            )
-            send_btn.click()
-            time.sleep(1)
-            return True
-        except TimeoutException:
-            print(f"  ⚠️  Could not find Send button for {name}.")
-            _dismiss_modal(driver)
-            return False
+        return ok
 
     except ElementClickInterceptedException:
         print(f"  ⚠️  Click intercepted for {name}. Dismissing overlays...")
@@ -307,6 +606,291 @@ def send_connection_request(driver, button, name, note_template):
         print(f"  ❌  Unexpected error for {name}: {e}")
         _dismiss_modal(driver)
         return False
+
+
+def _click_with_fallback(driver, element):
+    """Click an element trying multiple strategies (some LinkedIn buttons
+    only respond to real / trusted mouse events, others reject JS clicks)."""
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});", element
+        )
+        time.sleep(0.4)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 1) Native click — generates a trusted event.
+    try:
+        element.click()
+        return True
+    except (ElementClickInterceptedException, Exception):  # noqa: BLE001
+        pass
+
+    # 2) ActionChains — moves to the element, also trusted.
+    try:
+        webdriver.ActionChains(driver).move_to_element(element).pause(0.2).click().perform()
+        return True
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3) JS click — fastest but some menus ignore it.
+    try:
+        driver.execute_script("arguments[0].click();", element)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _find_more_button(driver):
+    """Find the 'More' button in the profile action bar.
+
+    Profile pages have MULTIPLE buttons labelled "More" (activity, experience,
+    education sections all have their own). We need the one in the top
+    action bar, next to Message/Follow. Strategy: prefer aria-label exact
+    matches first, then fall back to siblings of the Message button.
+    """
+    strategies = (
+        # Most reliable: explicit aria-label on the action-bar More button.
+        "//button[@aria-label='More actions']",
+        "//button[starts-with(@aria-label, 'More actions')]",
+        "//button[contains(@aria-label, 'More actions, distance')]",
+        # Sibling of Message/Follow (action bar layout).
+        "//button[normalize-space()='Message']/following::button[normalize-space()='More'][1]",
+        "//button[normalize-space()='Follow']/following::button[normalize-space()='More'][1]",
+        "//button[contains(@aria-label, 'Message')]/following::button[normalize-space()='More'][1]",
+        # Inside the top profile card.
+        "//section[contains(@class, 'pv-top-card')]//button[normalize-space()='More']",
+        "//section[contains(@class, 'pv-top-card')]//button[contains(@aria-label, 'More')]",
+        "//div[contains(@class, 'pv-top-card')]//button[normalize-space()='More']",
+        "//*[contains(@class, 'pvs-profile-actions')]//button[normalize-space()='More']",
+        # Generic — last resort.
+        "//main//button[@aria-label='More']",
+        "//main//button[normalize-space()='More']",
+        "//main//button[.//span[normalize-space()='More']]",
+    )
+    for xp in strategies:
+        for cand in driver.find_elements(By.XPATH, xp):
+            try:
+                if cand.is_displayed() and cand.is_enabled():
+                    return cand
+            except StaleElementReferenceException:
+                continue
+    return None
+
+
+def _wait_for_open_dropdown(driver, timeout=6.0):
+    """Wait until ANY visible dropdown/menu element appears."""
+    deadline = time.time() + timeout
+    selectors = (
+        "//div[@role='menu' and not(contains(@style, 'display: none'))]",
+        "//div[contains(@class, 'artdeco-dropdown__content--is-open')]",
+        "//div[contains(@class, 'artdeco-dropdown__content')]",
+        "//ul[@role='menu']",
+    )
+    while time.time() < deadline:
+        for sel in selectors:
+            for el in driver.find_elements(By.XPATH, sel):
+                try:
+                    if el.is_displayed():
+                        return el
+                except StaleElementReferenceException:
+                    continue
+        time.sleep(0.25)
+    return None
+
+
+def _find_connect_in_dropdown(driver):
+    """Find the 'Connect' item inside an open dropdown."""
+    strategies = (
+        # role=menuitem variants.
+        "//*[@role='menuitem' and (normalize-space()='Connect' "
+        "or .//*[normalize-space()='Connect'])]",
+        "//*[@role='menuitem' and contains(., 'Connect') "
+        "and not(contains(., 'Remove connection'))]",
+        # LinkedIn's dropdown item classes.
+        "//*[contains(@class, 'artdeco-dropdown__item') and contains(., 'Connect') "
+        "and not(contains(., 'Remove connection'))]",
+        "//*[contains(@class, 'dropdown__item') and contains(., 'Connect') "
+        "and not(contains(., 'Remove connection'))]",
+        # Inside an open menu container.
+        "//div[@role='menu']//*[normalize-space()='Connect']",
+        "//div[contains(@class, 'artdeco-dropdown__content')]"
+        "//*[normalize-space()='Connect']",
+        # Aria-label match (LinkedIn sometimes uses "Invite <Name> to connect").
+        "//*[contains(@aria-label, 'Invite') and contains(@aria-label, 'to connect')]",
+        # "Personalize invite" wording.
+        "//*[@role='menuitem' and contains(., 'Personalize invite')]",
+        "//div[contains(@class, 'artdeco-dropdown__content')]"
+        "//*[contains(., 'Personalize invite')]",
+    )
+    for xp in strategies:
+        for cand in driver.find_elements(By.XPATH, xp):
+            try:
+                if cand.is_displayed():
+                    return cand
+            except StaleElementReferenceException:
+                continue
+    return None
+
+
+def _dump_dropdown_items(driver, label="dropdown"):
+    """Print visible text of any open dropdown's items for debugging."""
+    items = driver.find_elements(
+        By.XPATH,
+        "//div[@role='menu']//*[@role='menuitem'] "
+        "| //div[contains(@class, 'artdeco-dropdown__content')]"
+        "//*[contains(@class, 'artdeco-dropdown__item')]",
+    )
+    visible_texts = []
+    for it in items:
+        try:
+            if it.is_displayed():
+                text = " ".join(it.text.split())
+                if text:
+                    visible_texts.append(text)
+        except StaleElementReferenceException:
+            continue
+    if visible_texts:
+        print(f"      🔍 Visible {label} items: {visible_texts}")
+    else:
+        print(f"      🔍 No visible {label} items found.")
+
+
+def send_connection_via_profile(
+    driver,
+    profile_url,
+    name,
+    note_template,
+    return_to_url=None,
+):
+    """
+    Rule-based profile-page connect flow (no LLM, no API costs).
+
+    Steps:
+      1. Navigate to the profile URL.
+      2. Try a direct Connect button in the action bar (some profiles show one).
+      3. Else click the "More" button, find "Connect" in its dropdown, click it.
+      4. Run the shared Add-a-note → type → Send flow.
+      5. If return_to_url is given, navigate back to it so the outer loop
+         can keep scanning the People page.
+
+    Returns True on success, False on skip/failure.
+    """
+    personalized_note = note_template.format(name=name)
+    if len(personalized_note) > 300:
+        print(
+            f"  ⚠️  Note for {name} is {len(personalized_note)} chars (max 300). "
+            "Truncating."
+        )
+        personalized_note = personalized_note[:297] + "..."
+
+    success = False
+    try:
+        driver.get(profile_url)
+        time.sleep(2)
+
+        # Wait for the profile to render and for action buttons to be present.
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "main"))
+            )
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((
+                    By.XPATH,
+                    "//main//button[contains(@aria-label, 'More') "
+                    "or contains(@aria-label, 'Message') "
+                    "or contains(@aria-label, 'Connect') "
+                    "or contains(@aria-label, 'Follow') "
+                    "or normalize-space()='More' "
+                    "or normalize-space()='Message']",
+                ))
+            )
+        except TimeoutException:
+            print(f"      ⚠️  Profile didn't load in time for {name}.")
+            return False
+
+        # Make sure we're at the top — More button is in the header.
+        try:
+            driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(0.5)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 1) Try a direct Connect button in the action bar first.
+        connect_opened = False
+        try:
+            connect_btn = driver.find_element(
+                By.XPATH,
+                "//main//button[@aria-label='Connect' "
+                "or (contains(@aria-label, 'Invite') "
+                "and contains(@aria-label, 'to connect'))]",
+            )
+            if connect_btn.is_displayed():
+                print(f"      → Direct Connect button found in action bar.")
+                if _click_with_fallback(driver, connect_btn):
+                    time.sleep(1.5)
+                    connect_opened = True
+        except NoSuchElementException:
+            pass
+
+        # 2) Otherwise open the More menu and find Connect inside it.
+        if not connect_opened:
+            more_btn = _find_more_button(driver)
+            if more_btn is None:
+                print(f"      ⚠️  No 'More' button on {name}'s profile.")
+                return False
+
+            print(f"      → Clicking 'More' button…")
+            if not _click_with_fallback(driver, more_btn):
+                print(f"      ⚠️  Could not click 'More' for {name}.")
+                return False
+
+            # Wait for the dropdown to actually appear before searching.
+            dropdown = _wait_for_open_dropdown(driver, timeout=6.0)
+            if dropdown is None:
+                print(f"      ⚠️  'More' clicked but dropdown didn't open for {name}.")
+                return False
+
+            connect_item = _find_connect_in_dropdown(driver)
+            if connect_item is None:
+                print(
+                    f"      ⚠️  No 'Connect' option in More menu for {name} "
+                    "(already pending, blocked, or out of network)."
+                )
+                _dump_dropdown_items(driver, label="More menu")
+                from selenium.webdriver.common.keys import Keys
+                try:
+                    webdriver.ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+                except Exception:  # noqa: BLE001
+                    pass
+                return False
+
+            print(f"      → Clicking 'Connect' in More menu…")
+            if not _click_with_fallback(driver, connect_item):
+                print(f"      ⚠️  Could not click 'Connect' menu item for {name}.")
+                return False
+            time.sleep(1.5)
+
+        success = _fill_and_send_connect_modal(driver, name, personalized_note)
+        if not success:
+            _dismiss_modal(driver)
+        return success
+
+    except ElementClickInterceptedException:
+        print(f"      ⚠️  Click intercepted for {name}. Dismissing overlays...")
+        _dismiss_modal(driver)
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"      ❌  Profile-flow error for {name}: {e}")
+        _dismiss_modal(driver)
+        return False
+    finally:
+        if return_to_url:
+            try:
+                driver.get(return_to_url)
+                time.sleep(2)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _dismiss_modal(driver):
@@ -352,7 +936,58 @@ def main():
         action="store_true",
         help="Only list people found — don't actually send requests.",
     )
+    parser.add_argument(
+        "--via-profile",
+        action="store_true",
+        help="For people without an inline Connect button, visit their "
+             "profile page and connect via the 'More' menu using rule-based "
+             "Selenium (FREE — no LLM, no API costs). Returns to the People "
+             "page between profiles.",
+    )
+    parser.add_argument(
+        "--via-profile-only",
+        action="store_true",
+        help="Skip the inline Connect-button flow entirely; only run the "
+             "rule-based profile-page flow. Implies --via-profile.",
+    )
+    parser.add_argument(
+        "--max-profile",
+        type=int,
+        default=20,
+        help="Max profiles to process via the rule-based profile flow "
+             "(default: 20).",
+    )
+    parser.add_argument(
+        "--agent-fallback",
+        action="store_true",
+        help="If the rule-based profile flow fails for a person (e.g. "
+             "LinkedIn shifted the More menu), retry that person with a "
+             "Claude-driven browser-use agent. Requires `browser-use` "
+             "installed and ANTHROPIC_API_KEY set. Costs ~$0.05/profile.",
+    )
+    parser.add_argument(
+        "--agent-only",
+        action="store_true",
+        help="Skip ALL Selenium paths (inline + profile-page); only run "
+             "the LLM agent on profiles without an inline Connect button.",
+    )
+    parser.add_argument(
+        "--max-agent",
+        type=int,
+        default=20,
+        help="Max profiles to hand off to the agent (default: 20).",
+    )
+    parser.add_argument(
+        "--agent-model",
+        default="claude-sonnet-4-0",
+        help="Anthropic model the agent uses (default: claude-sonnet-4-0).",
+    )
     args = parser.parse_args()
+
+    # --agent-only implies the agent; --via-profile-only implies via-profile.
+    use_via_profile = args.via_profile or args.via_profile_only
+    use_agent = args.agent_fallback or args.agent_only
+    skip_inline = args.via_profile_only or args.agent_only
 
     print("🚀 LinkedIn Auto-Connect")
     print(f"   URL : {args.url}")
@@ -403,42 +1038,208 @@ def main():
         scroll_to_bottom(driver, needed=args.max)
         time.sleep(2)
 
-        # Find connect buttons
-        targets = find_connect_buttons_and_names(driver)
-        print(f"\n🔎 Found {len(targets)} people with 'Connect' button.\n")
-
-        if not targets:
-            print("No connectable people found on this page.")
-            print("Make sure the URL points to a company People page with visible 'Connect' buttons.")
-            return
-
         sent = 0
         skipped = 0
+        targets = []
 
-        for i, (btn, name) in enumerate(targets):
-            if sent >= args.max:
-                print(f"\n🛑 Reached max limit of {args.max} requests. Stopping.")
-                break
+        if not skip_inline:
+            # Find connect buttons (fast Selenium path).
+            targets = find_connect_buttons_and_names(driver)
+            print(f"\n🔎 Found {len(targets)} people with an inline 'Connect' button.\n")
 
-            print(f"[{i+1}/{len(targets)}] {name}", end=" — ")
+            for i, (btn, name) in enumerate(targets):
+                if sent >= args.max:
+                    print(f"\n🛑 Reached max limit of {args.max} requests. Stopping inline flow.")
+                    break
 
-            if args.dry_run:
-                print(f"would send note: \"{args.note.format(name=name)[:60]}...\"")
-                continue
+                print(f"[{i+1}/{len(targets)}] {name}", end=" — ")
 
-            success = send_connection_request(driver, btn, name, args.note)
-            if success:
-                sent += 1
-                print(f"✅ Request sent!")
+                if args.dry_run:
+                    print(f"would send note: \"{args.note.format(name=name)[:60]}...\"")
+                    continue
+
+                success = send_connection_request(driver, btn, name, args.note)
+                if success:
+                    sent += 1
+                    print(f"✅ Request sent!")
+                else:
+                    skipped += 1
+                    print(f"⏭️  Skipped.")
+
+                human_delay()
+
+            print(f"\n{'='*50}")
+            print(f"Inline Selenium flow — Sent: {sent}   ⏭️  Skipped: {skipped}   Total: {len(targets)}")
+            print(f"{'='*50}")
+        else:
+            reason = "--agent-only" if args.agent_only else "--via-profile-only"
+            print(f"\n⏭️  {reason}: skipping inline Selenium 'Connect' flow.")
+
+        # ── Rule-based profile-page flow (FREE) ──
+        # Anyone missed by the inline flow is processed by walking to their
+        # profile, clicking More → Connect → Add a note → Send. The agent
+        # fallback (if enabled) only retries profiles this flow couldn't handle.
+        profile_remaining = []  # profiles that even the rule flow couldn't connect
+
+        if use_via_profile:
+            profile_targets = find_profiles_without_connect(driver)
+
+            if not profile_targets:
+                print("\nℹ️  No profiles found that need the profile-page flow.")
             else:
-                skipped += 1
-                print(f"⏭️  Skipped.")
+                if len(profile_targets) > args.max_profile:
+                    print(
+                        f"\n🔎 Found {len(profile_targets)} profiles without inline Connect; "
+                        f"capping at --max-profile={args.max_profile}."
+                    )
+                    profile_targets = profile_targets[: args.max_profile]
+                else:
+                    print(
+                        f"\n🔎 Found {len(profile_targets)} profiles without inline Connect."
+                    )
 
-            human_delay()
+                if args.dry_run:
+                    print("\n🔍 DRY RUN — profile-flow targets that WOULD be processed:\n")
+                    for i, (url, name) in enumerate(profile_targets, 1):
+                        note = args.note.format(name=name)
+                        truncated = ""
+                        if len(note) > 300:
+                            note = note[:297] + "..."
+                            truncated = " (truncated to 300 chars)"
+                        print(f"   [{i}] {name}")
+                        print(f"       URL  : {url}")
+                        print(f"       Note{truncated}:")
+                        for line in note.splitlines() or [note]:
+                            print(f"         │ {line}")
+                        print(
+                            "       Will: open URL → click More → click Connect → "
+                            "click Add a note → type the above note → click Send → "
+                            "return to People page"
+                        )
+                        print()
+                else:
+                    p_sent = 0
+                    p_skipped = 0
+                    print(
+                        f"\n🛠️  Running rule-based profile flow over "
+                        f"{len(profile_targets)} profiles (no API costs)...\n"
+                    )
+                    for i, (url, name) in enumerate(profile_targets, 1):
+                        print(f"   [{i}/{len(profile_targets)}] {name}  →  {url}")
+                        ok = send_connection_via_profile(
+                            driver,
+                            url,
+                            name,
+                            args.note,
+                            return_to_url=args.url,
+                        )
+                        if ok:
+                            p_sent += 1
+                            print(f"      ✅ Sent.")
+                        else:
+                            p_skipped += 1
+                            profile_remaining.append((url, name))
+                            print(f"      ⏭️  Skipped (will retry via agent if --agent-fallback).")
+                        human_delay()
 
-        print(f"\n{'='*50}")
-        print(f"✅ Sent: {sent}   ⏭️  Skipped: {skipped}   Total: {len(targets)}")
-        print(f"{'='*50}")
+                    print(f"\n{'='*50}")
+                    print(
+                        f"Profile flow — Sent: {p_sent}   "
+                        f"⏭️  Skipped: {p_skipped}   "
+                        f"Total: {len(profile_targets)}"
+                    )
+                    print(f"{'='*50}")
+
+        # ── Agent fallback for profiles without an inline Connect button ──
+        # If the rule-based profile flow already ran, the agent only retries
+        # the people it failed on. Otherwise, the agent processes everyone
+        # without an inline Connect button.
+        if use_agent:
+            if use_via_profile:
+                agent_targets = profile_remaining
+                if agent_targets:
+                    print(
+                        f"\n🔁 Agent will retry {len(agent_targets)} profile(s) "
+                        "that the rule-based flow couldn't handle."
+                    )
+            else:
+                agent_targets = find_profiles_without_connect(driver)
+
+            if not agent_targets:
+                print("\nℹ️  No profiles found that need agent fallback.")
+            else:
+                if len(agent_targets) > args.max_agent:
+                    print(
+                        f"\n🔎 Found {len(agent_targets)} profiles without inline Connect; "
+                        f"capping at --max-agent={args.max_agent}."
+                    )
+                    agent_targets = agent_targets[: args.max_agent]
+                else:
+                    print(
+                        f"\n🔎 Found {len(agent_targets)} profiles without inline Connect."
+                    )
+
+                if args.dry_run:
+                    print("\n🔍 DRY RUN — agent targets that WOULD be processed:\n")
+                    for i, (url, name) in enumerate(agent_targets, 1):
+                        note = args.note.format(name=name)
+                        truncated = ""
+                        if len(note) > 300:
+                            note = note[:297] + "..."
+                            truncated = " (truncated to 300 chars)"
+                        print(f"   [{i}] {name}")
+                        print(f"       URL  : {url}")
+                        print(f"       Note{truncated}:")
+                        # Indent the note for readability.
+                        for line in note.splitlines() or [note]:
+                            print(f"         │ {line}")
+                        print(
+                            f"       Agent will: open URL → click More → click Connect "
+                            f"→ click Add a note → type the above note → click Send"
+                        )
+                        print()
+                else:
+                    if not os.environ.get("ANTHROPIC_API_KEY"):
+                        print(
+                            "\n❌ ANTHROPIC_API_KEY is not set. "
+                            "Export it before using --agent-fallback.\n"
+                            "   export ANTHROPIC_API_KEY=sk-ant-..."
+                        )
+                    else:
+                        try:
+                            from agent_fallback import connect_batch_via_agent
+                        except ImportError as e:
+                            print(f"\n❌ Could not import agent_fallback: {e}")
+                            connect_batch_via_agent = None  # type: ignore
+
+                        if connect_batch_via_agent is not None:
+                            print(
+                                f"\n🤖 Handing {len(agent_targets)} profiles to the "
+                                f"Claude agent ({args.agent_model}) via CDP on port {DEBUG_PORT}...\n"
+                            )
+                            results = asyncio.run(
+                                connect_batch_via_agent(
+                                    agent_targets,
+                                    note_template=args.note,
+                                    cdp_port=DEBUG_PORT,
+                                    model=args.agent_model,
+                                )
+                            )
+                            agent_sent = sum(1 for r in results if r.success)
+                            print(f"\n{'='*50}")
+                            print(
+                                f"Agent flow — Sent: {agent_sent}   "
+                                f"⏭️  Skipped/failed: {len(results) - agent_sent}   "
+                                f"Total: {len(results)}"
+                            )
+                            print(f"{'='*50}")
+
+        if not targets and not use_via_profile and not use_agent:
+            print("No connectable people found on this page.")
+            print("Make sure the URL points to a company People page with visible 'Connect' buttons,")
+            print("or re-run with --via-profile (free) or --agent-fallback (paid) to also try")
+            print("profiles that require the 'More' menu on their profile page.")
+            return
 
     except Exception as e:
         print(f"\n❌ Error: {e}")
