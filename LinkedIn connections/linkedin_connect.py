@@ -43,10 +43,10 @@ from selenium.common.exceptions import (
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
 
 NOTE_TEMPLATE = (
-    "Hi {name}! I'm exploring agri equipment's future. Nakul here, a "
+    "Hi {name}! I'm exploring agri machinery's future. Nakul here, a "
     "final-year IITB student. In academia, practical industry insight "
     "is a blind spot. I'm curious about new machinery development and "
-    "vision. Your John Deere expertise would be huge to learn from! "
+    "vision. Your Moonrider.ai expertise would be huge to learn from! "
     "Quick call or online meet?"
 )
 
@@ -1163,6 +1163,25 @@ def main():
         help="Only list people found — don't actually send requests.",
     )
     parser.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Skip the first N candidates in the page's natural order before "
+             "starting to send requests. Useful for resuming after a previous "
+             "run, or skipping the top profiles you've already contacted "
+             "manually. Applies independently to the inline, profile, and "
+             "agent flows (since they operate on different candidate pools).",
+    )
+    parser.add_argument(
+        "--inline-only",
+        action="store_true",
+        help="Only run the fast inline 'Connect'-button flow on the People "
+             "page. Explicitly skips the profile-page flow and the agent "
+             "flow even if --via-profile / --agent-fallback are also passed. "
+             "Same as the default behavior, just made explicit.",
+    )
+    parser.add_argument(
         "--via-profile",
         action="store_true",
         help="For people without an inline Connect button, visit their "
@@ -1216,6 +1235,18 @@ def main():
     use_via_profile = args.via_profile or args.via_profile_only
     use_agent = args.agent_fallback or args.agent_only
     skip_inline = args.via_profile_only or args.agent_only
+
+    # --inline-only is the explicit "fast path only" switch. It wins over
+    # every other path flag if the user passed conflicting options.
+    if args.inline_only:
+        if use_via_profile or use_agent or skip_inline:
+            print(
+                "ℹ️  --inline-only is set; ignoring --via-profile / "
+                "--via-profile-only / --agent-fallback / --agent-only."
+            )
+        use_via_profile = False
+        use_agent = False
+        skip_inline = False
 
     print("🚀 LinkedIn Auto-Connect")
     print(f"   URL : {args.url}")
@@ -1273,9 +1304,16 @@ def main():
         if not skip_inline:
             # Find connect buttons (fast Selenium path).
             targets = find_connect_buttons_and_names(driver)
-            print(f"\n🔎 Found {len(targets)} people with an inline 'Connect' button.\n")
+            skip_msg = f", will skip first {args.skip}" if args.skip > 0 else ""
+            print(
+                f"\n🔎 Found {len(targets)} people with an inline 'Connect' "
+                f"button{skip_msg}.\n"
+            )
 
             for i, (btn, name) in enumerate(targets):
+                if i < args.skip:
+                    print(f"[{i+1}/{len(targets)}] {name} — ⏩ skipped (--skip)")
+                    continue
                 if sent >= args.max:
                     print(f"\n🛑 Reached max limit of {args.max} requests. Stopping inline flow.")
                     break
@@ -1317,13 +1355,25 @@ def main():
             if not initial_targets:
                 print("\nℹ️  No profiles found that need the profile-page flow.")
             elif args.dry_run:
-                # In dry-run we just preview the first `target_sent` candidates
-                # that are visible right now. We don't actually scroll for more.
-                preview = initial_targets[:target_sent]
+                # In dry-run we just preview the candidates that are visible
+                # right now (after honoring --skip). No scrolling happens.
+                effective = initial_targets[max(0, args.skip):]
+                preview = effective[:target_sent]
+                skip_note = (
+                    f", skipping first {args.skip}" if args.skip > 0 else ""
+                )
                 print(
                     f"\n🔎 Found {len(initial_targets)} profiles without inline Connect "
-                    f"(showing first {len(preview)} for dry run; target is {target_sent} successful sends)."
+                    f"(showing first {len(preview)} for dry run{skip_note}; "
+                    f"target is {target_sent} successful sends)."
                 )
+                if args.skip > 0 and initial_targets[:args.skip]:
+                    print(
+                        f"\n⏩ Would skip these {min(args.skip, len(initial_targets))} "
+                        "profile(s) at the top:"
+                    )
+                    for i, (url, name) in enumerate(initial_targets[:args.skip], 1):
+                        print(f"   ⏩ [{i}] {name}  →  {url}")
                 print("\n🔍 DRY RUN — profile-flow targets that WOULD be processed:\n")
                 for i, (url, name) in enumerate(preview, 1):
                     note = args.note.format(name=name)
@@ -1343,9 +1393,10 @@ def main():
                     )
                     print()
             else:
+                skip_msg = f", skipping first {args.skip}" if args.skip > 0 else ""
                 print(
                     f"\n🛠️  Running rule-based profile flow — target: {target_sent} "
-                    f"successful sends (safety cap: {attempts_cap} attempts)...\n"
+                    f"successful sends (safety cap: {attempts_cap} attempts{skip_msg})...\n"
                 )
 
                 p_sent = 0
@@ -1353,6 +1404,7 @@ def main():
                 attempts = 0
                 attempted_urls = set()
                 scroll_failures = 0
+                skip_remaining = max(0, args.skip)
 
                 while p_sent < target_sent and attempts < attempts_cap:
                     # Make sure we're on the People page before scanning.
@@ -1400,6 +1452,19 @@ def main():
                             break
                         if attempts >= attempts_cap:
                             break
+
+                        # Honor --skip BEFORE doing anything: mark these as
+                        # "attempted" so they're never re-fetched, but don't
+                        # count them toward attempts/sends.
+                        if skip_remaining > 0:
+                            attempted_urls.add(url)
+                            consumed = args.skip - skip_remaining + 1
+                            skip_remaining -= 1
+                            print(
+                                f"   ⏩ Skipping {name}  →  {url}  "
+                                f"({consumed}/{args.skip})"
+                            )
+                            continue
 
                         attempts += 1
                         attempted_urls.add(url)
@@ -1454,6 +1519,16 @@ def main():
                     )
             else:
                 agent_targets = find_profiles_without_connect(driver)
+                # --skip only makes sense for the standalone agent path
+                # (i.e. NOT after the via-profile flow, where leftovers are
+                # already filtered).
+                if args.skip > 0 and agent_targets:
+                    skipped_top = agent_targets[: args.skip]
+                    agent_targets = agent_targets[args.skip:]
+                    print(
+                        f"\n⏩ Skipping first {len(skipped_top)} agent target(s) "
+                        "as requested by --skip."
+                    )
 
             if not agent_targets:
                 print("\nℹ️  No profiles found that need agent fallback.")
