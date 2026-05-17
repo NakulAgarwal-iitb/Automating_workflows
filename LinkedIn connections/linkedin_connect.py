@@ -43,11 +43,10 @@ from selenium.common.exceptions import (
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
 
 NOTE_TEMPLATE = (
-    "Hi {name}! I'm exploring agri machinery's future. Nakul here, a "
-    "final-year IITB student. In academia, practical industry insight "
-    "is a blind spot. I'm curious about new machinery development and "
-    "vision. Your Moonrider.ai expertise would be huge to learn from! "
-    "Quick call or online meet?"
+    "Hi {name}! I'm exploring future of agri machinery. Nakul here, an Emergent "
+    "Ventures fellow. Being in India, US ops are a blind spot. I'm curious "
+    "to know about the workflow of farms, and your on-the-ground expertise "
+    "would be huge to learn from. Open to a quick chat or online meet?"
 )
 
 # Delay range (seconds) between each connection request to appear human-like
@@ -1198,11 +1197,12 @@ def main():
     parser.add_argument(
         "--max-profile",
         type=int,
-        default=20,
-        help="TARGET number of successful sends via the profile flow "
-             "(default: 20). If some profiles get skipped, the script "
-             "automatically scrolls for more candidates and keeps trying "
-             "until this many sends succeed (or a 3× safety cap is hit).",
+        default=None,
+        help="TARGET number of successful sends via the profile flow. "
+             "If unset, inherits --max (so a single --max acts as a global "
+             "cap). If some profiles get skipped, the script scrolls for "
+             "more candidates and keeps trying until this many sends "
+             "succeed (or a 3× safety cap is hit).",
     )
     parser.add_argument(
         "--agent-fallback",
@@ -1221,8 +1221,9 @@ def main():
     parser.add_argument(
         "--max-agent",
         type=int,
-        default=20,
-        help="Max profiles to hand off to the agent (default: 20).",
+        default=None,
+        help="Max profiles to hand off to the agent. If unset, inherits "
+             "--max (so a single --max acts as a global cap).",
     )
     parser.add_argument(
         "--agent-model",
@@ -1232,6 +1233,25 @@ def main():
     args = parser.parse_args()
 
     # --agent-only implies the agent; --via-profile-only implies via-profile.
+    # If the user only set --max, treat it as a global cap that also raises
+    # the profile and agent caps. Explicit per-flow flags still win.
+    inherited_profile = args.max_profile is None
+    inherited_agent = args.max_agent is None
+    if args.max_profile is None:
+        args.max_profile = args.max
+    if args.max_agent is None:
+        args.max_agent = args.max
+    if inherited_profile or inherited_agent:
+        inherited_bits = []
+        if inherited_profile:
+            inherited_bits.append(f"--max-profile={args.max_profile}")
+        if inherited_agent:
+            inherited_bits.append(f"--max-agent={args.max_agent}")
+        print(
+            f"ℹ️  Inheriting --max for: {', '.join(inherited_bits)} "
+            f"(pass them explicitly to override)."
+        )
+
     use_via_profile = args.via_profile or args.via_profile_only
     use_agent = args.agent_fallback or args.agent_only
     skip_inline = args.via_profile_only or args.agent_only
