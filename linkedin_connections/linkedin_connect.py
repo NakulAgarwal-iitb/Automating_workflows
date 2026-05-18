@@ -136,6 +136,46 @@ def _kill_chrome_on_debug_port(port):
     return False
 
 
+def _find_chrome_executable():
+    """Return the Chrome executable path for the current OS, prompting if not found."""
+    import platform
+    import shutil
+
+    system = platform.system()
+    candidates = []
+
+    if system == "Darwin":
+        candidates = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+    elif system == "Linux":
+        candidates = [
+            shutil.which("google-chrome"),
+            shutil.which("google-chrome-stable"),
+            shutil.which("chromium-browser"),
+            shutil.which("chromium"),
+        ]
+    elif system == "Windows":
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+
+    print(
+        f"⚠️  Could not find Chrome automatically on {system}.\n"
+        "Please enter the full path to your Chrome/Chromium executable:"
+    )
+    user_path = input("Chrome path: ").strip()
+    if not os.path.isfile(user_path):
+        raise FileNotFoundError(f"Chrome executable not found at: {user_path}")
+    return user_path
+
+
 def _spawn_chrome(url):
     """Spawn a fresh Chrome process with our automation profile.
 
@@ -145,9 +185,10 @@ def _spawn_chrome(url):
     dropdown when the user switched away to a different tab/window.
     """
     os.makedirs(AUTOMATION_PROFILE_DIR, exist_ok=True)
+    chrome_exe = _find_chrome_executable()
     subprocess.Popen(
         [
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            chrome_exe,
             f"--remote-debugging-port={DEBUG_PORT}",
             f"--user-data-dir={AUTOMATION_PROFILE_DIR}",
             "--no-first-run",
