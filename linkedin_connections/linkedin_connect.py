@@ -43,10 +43,11 @@ from selenium.common.exceptions import (
 # ─── CONFIGURATION ────────────────────────────────────────────────────────────
 
 NOTE_TEMPLATE = (
-    "Hi {name}! I'm exploring future of agri machinery. Nakul here, an Emergent "
-    "Ventures fellow. Being in India, US ops are a blind spot. I'm curious "
-    "to know about the workflow of farms, and your on-the-ground expertise "
-    "would be huge to learn from. Open to a quick chat or online meet?"
+    "Hi {name}! I'm exploring agri equipment's future. {sender_name} here, a "
+    "final-year IITB student. In academia, practical industry insight "
+    "is a blind spot. I'm curious about new machinery development and "
+    "vision. Your expertise would be huge to learn from! "
+    "Quick call or online meet?"
 )
 
 # Delay range (seconds) between each connection request to appear human-like
@@ -183,6 +184,11 @@ def _spawn_chrome(url):
     they stop Chrome from pausing JS / animations when the tab is not
     in the foreground, which used to break the LinkedIn More-menu
     dropdown when the user switched away to a different tab/window.
+
+    Note: --disable-blink-features=AutomationControlled was removed
+    because Chrome shows a yellow "unsupported command-line flag"
+    warning bar when it's set. Stealth (hiding navigator.webdriver)
+    is now applied via CDP after attach — see _apply_cdp_stealth().
     """
     os.makedirs(AUTOMATION_PROFILE_DIR, exist_ok=True)
     chrome_exe = _find_chrome_executable()
@@ -193,7 +199,6 @@ def _spawn_chrome(url):
             f"--user-data-dir={AUTOMATION_PROFILE_DIR}",
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-blink-features=AutomationControlled",
             # Keep the tab running at full speed even when backgrounded —
             # LinkedIn's dropdowns animate in via requestAnimationFrame,
             # which Chrome pauses on hidden tabs by default.
@@ -271,6 +276,36 @@ def launch_chrome(url):
     sys.exit(1)
 
 
+def _apply_cdp_stealth(driver):
+    """Hide automation fingerprints via CDP.
+
+    Replaces the `--disable-blink-features=AutomationControlled` flag we
+    used to pass at launch — that flag causes Chrome to show a yellow
+    warning bar at the top of every tab. Doing it through CDP runs before
+    any page JS, so navigator.webdriver is undefined for everything
+    LinkedIn inspects.
+    """
+    stealth_js = """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5],
+        });
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en'],
+        });
+        window.chrome = window.chrome || { runtime: {} };
+    """
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument", {"source": stealth_js}
+        )
+        # addScriptToEvaluateOnNewDocument only fires on the next document
+        # load, so apply once to the current page too.
+        driver.execute_script(stealth_js)
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  Couldn't install CDP stealth shim: {e}")
+
+
 def get_chrome_driver():
     """Connect to the running Chrome instance via remote debugging.
 
@@ -280,7 +315,7 @@ def get_chrome_driver():
     opts = Options()
     opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{DEBUG_PORT}")
     try:
-        return webdriver.Chrome(options=opts)
+        driver = webdriver.Chrome(options=opts)
     except Exception as e:  # noqa: BLE001
         msg = str(e)
         if "unable to discover open pages" in msg or "cannot connect to chrome" in msg:
@@ -295,6 +330,8 @@ def get_chrome_driver():
                 "auto-recover, but a hard kill always works.)"
             )
         raise
+    _apply_cdp_stealth(driver)
+    return driver
 
 
 def human_delay():
@@ -613,65 +650,365 @@ def _fill_and_send_connect_modal(driver, name, personalized_note):
     has been opened. Returns True on Send-clicked, False otherwise.
     Caller is responsible for dismissing leftover modals on False.
     """
-    add_note_clicked = False
-    try:
-        add_note_btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable(
-                (By.XPATH, "//button[contains(@aria-label, 'Add a note')]")
-            )
-        )
-        add_note_btn.click()
-        time.sleep(1)
-        add_note_clicked = True
-    except TimeoutException:
+    # Wait for the connect modal to actually appear. On Linux Chrome it can
+    # take several seconds. We poll for any of the modal's canonical markers
+    # (the Add-a-note button, the Send button, or the textarea) — these are
+    # only ever present when the modal is open, so we won't false-match on
+    # other page state.
+    modal_ready = False
+    modal_match_info = None
+    poll_start = time.time()
+    deadline = poll_start + 12
+    # Counter so we only log JS errors a couple of times rather than 30x.
+    js_err_count = [0]
+    while time.time() < deadline:
         try:
-            add_note_btn = driver.find_element(
-                By.XPATH, "//button[contains(., 'Add a note')]"
-            )
-            add_note_btn.click()
-            time.sleep(1)
-            add_note_clicked = True
-        except NoSuchElementException:
+            found = driver.execute_script("""
+                // Walk the WHOLE DOM (including same-origin iframes and the
+                // shadow DOMs we can reach) looking for a button that is
+                // textually 'Add a note' / 'Send without a note' / 'Send
+                // invitation', or a textarea[name=message]. Returns an
+                // object describing the first visible match, or null.
+                function describe(el, sel, where) {
+                    const r = el.getBoundingClientRect();
+                    return {
+                        selector: sel,
+                        where: where,
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || '',
+                        text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+                        ariaLabel: ((el.getAttribute && el.getAttribute('aria-label')) || '').slice(0, 80),
+                        rect: {x: Math.round(r.x), y: Math.round(r.y),
+                               w: Math.round(r.width), h: Math.round(r.height)},
+                    };
+                }
+                function walk(root, where) {
+                    const markerSelectors = [
+                        'button[aria-label*="Add a note" i]',
+                        'button[aria-label*="Send invitation" i]',
+                        'button[aria-label*="Send without a note" i]',
+                        'textarea[name="message"]',
+                        'textarea#custom-message',
+                        '[data-test-modal-id="send-invite-modal"]',
+                        '[data-test-modal]',
+                        'dialog[open]',
+                    ];
+                    for (const sel of markerSelectors) {
+                        let nodes;
+                        try { nodes = root.querySelectorAll(sel); }
+                        catch (e) { continue; }
+                        for (const el of nodes) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                                return describe(el, sel, where);
+                            }
+                        }
+                    }
+                    let btns;
+                    try {
+                        btns = root.querySelectorAll('button, [role="button"], a[role="button"]');
+                    } catch (e) { btns = []; }
+                    for (const b of btns) {
+                        const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                        const aria = (b.getAttribute && (b.getAttribute('aria-label') || '')).toLowerCase();
+                        const combined = t + ' ' + aria;
+                        if (combined.includes('add a note')
+                            || combined.includes('send without a note')
+                            || combined.includes('send invitation')) {
+                            const r = b.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) {
+                                return describe(b, '[text-walk]', where);
+                            }
+                        }
+                    }
+                    try {
+                        const all = root.querySelectorAll('*');
+                        for (const el of all) {
+                            if (el.shadowRoot) {
+                                const m = walk(el.shadowRoot, where + ' > shadow');
+                                if (m) return m;
+                            }
+                        }
+                    } catch (e) { /* ignore */ }
+                    return null;
+                }
+                let m = walk(document, 'document');
+                if (m) return m;
+                try {
+                    let i = 0;
+                    for (const f of document.querySelectorAll('iframe')) {
+                        const src = (f.getAttribute('src') || '');
+                        try {
+                            const doc = f.contentDocument;
+                            if (doc) {
+                                m = walk(doc, 'iframe[' + i + '] src=' + src.slice(0, 60));
+                                if (m) return m;
+                            }
+                        } catch (e) { /* cross-origin */ }
+                        i++;
+                    }
+                } catch (e) { /* ignore */ }
+                return null;
+            """)
+            if found:
+                modal_ready = True
+                modal_match_info = found
+                break
+        except Exception as e:  # noqa: BLE001
+            # Log the first 2 errors only — silent failure was hiding bugs.
+            if js_err_count[0] < 2:
+                print(f"      ⚠️  Modal-poll JS error: {e}")
+                js_err_count[0] += 1
+        time.sleep(0.4)
+    poll_elapsed = time.time() - poll_start
+    if modal_ready:
+        info = modal_match_info or {}
+        print(
+            f"      ✓ Modal detected after {poll_elapsed:.1f}s "
+            f"via selector {info.get('selector')!r} in {info.get('where')!r} "
+            f"(tag={info.get('tag')!r} text={info.get('text')!r} "
+            f"aria-label={info.get('ariaLabel')!r} rect={info.get('rect')})"
+        )
+        time.sleep(0.6)  # let React finish mounting children
+    else:
+        print(f"      ✗ Modal never appeared (waited {poll_elapsed:.1f}s)")
+        _dump_modal_diagnostics(driver, name, "modal-poll-timeout")
+
+    # LinkedIn now hosts the Connect modal inside an iframe (src='/preload/...')
+    # on many profiles. None of our XPath/CSS searches will see anything
+    # inside that iframe until we switch the Selenium context into it.
+    # We detect this once here and stay inside the frame for the rest of
+    # this function. A try/finally at the call site (this function's outer
+    # wrapper) restores default_content even on exceptions.
+    switched_into_iframe = False
+    iframe_el = _find_invite_iframe(driver)
+    if iframe_el is not None and _iframe_contains_invite_markers(driver, iframe_el):
+        try:
+            src = (iframe_el.get_attribute("src") or "")[:80]
+            driver.switch_to.frame(iframe_el)
+            switched_into_iframe = True
             print(
-                f"  ⚠️  Could not find 'Add a note' button for {name}. "
-                "Sending without note."
+                f"      🔁 Switched into invite iframe — modal lives there "
+                f"(src={src!r})."
             )
-
-    if add_note_clicked:
-        try:
-            note_field = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((
-                    By.CSS_SELECTOR,
-                    "textarea[name='message'], textarea#custom-message, "
-                    "textarea.connect-button-send-invite__custom-message",
-                ))
-            )
-            note_field.clear()
-            for char in personalized_note:
-                note_field.send_keys(char)
-                time.sleep(random.uniform(0.01, 0.04))
-            time.sleep(0.5)
-        except TimeoutException:
-            print(f"  ⚠️  Could not find note text area for {name}.")
-            return False
+        except Exception as e:  # noqa: BLE001
+            print(f"      ⚠️  Could not switch into invite iframe: {e}")
 
     try:
-        send_btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((
-                By.XPATH,
-                "//button[contains(@aria-label, 'Send invitation')]"
-                " | //button[contains(@aria-label, 'Send now')]"
-                " | //button[contains(@aria-label, 'Send without a note')]"
-                " | //button[contains(@aria-label, 'Send')]"
-                " | //button[contains(., 'Send')]",
-            ))
+        return _do_invite_modal_in_current_context(
+            driver, name, personalized_note
         )
-        send_btn.click()
-        time.sleep(1)
-        return True
-    except TimeoutException:
-        print(f"  ⚠️  Could not find Send button for {name}.")
+    finally:
+        if switched_into_iframe:
+            try:
+                driver.switch_to.default_content()
+                print(f"      🔁 Switched back to main document.")
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _do_invite_modal_in_current_context(driver, name, personalized_note):
+    """
+    Add-a-note → type note → Send, with full Shadow-DOM support.
+
+    LinkedIn renders the Connect modal inside a Shadow DOM (poll output
+    reports 'where=document > shadow'). Selenium's find_element / XPath
+    APIs cannot pierce shadow roots — every interaction here therefore
+    runs via execute_script with JS that recursively walks the shadow
+    tree (plus same-origin iframes for older variants).
+
+    For the textarea we use React's native value setter + dispatchEvent
+    so React's onChange fires and the Send button enables.
+    """
+
+    # Helpers injected into every step. Walks document + every reachable
+    # shadow root, returning the first element matching predicate(el).
+    js_helpers = """
+        function findShadowDeep(root, predicate) {
+            const stack = [root];
+            while (stack.length) {
+                const node = stack.pop();
+                let kids;
+                try {
+                    kids = node.querySelectorAll
+                        ? node.querySelectorAll('*') : [];
+                } catch (e) { continue; }
+                for (const k of kids) {
+                    try { if (predicate(k)) return k; } catch (e) {}
+                    if (k.shadowRoot) stack.push(k.shadowRoot);
+                }
+            }
+            return null;
+        }
+        function findAnywhere(predicate) {
+            let el = findShadowDeep(document, predicate);
+            if (el) return el;
+            for (const f of document.querySelectorAll('iframe')) {
+                try {
+                    const doc = f.contentDocument;
+                    if (doc) {
+                        el = findShadowDeep(doc, predicate);
+                        if (el) return el;
+                    }
+                } catch (e) { /* cross-origin */ }
+            }
+            return null;
+        }
+        function isVisible(el) {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        }
+        function btnText(el) {
+            const t = (el.innerText || el.textContent || '').trim().toLowerCase();
+            const aria = ((el.getAttribute && el.getAttribute('aria-label')) || '').toLowerCase();
+            return t + ' | ' + aria;
+        }
+        function isBtnish(el) {
+            if (!el || !el.tagName) return false;
+            if (el.tagName === 'BUTTON') return true;
+            if (el.getAttribute && el.getAttribute('role') === 'button') return true;
+            return false;
+        }
+    """
+
+    # Step 1: click "Add a note" (or notice the textarea is already mounted).
+    click_add_note_js = js_helpers + """
+        const taPred = el => (
+            el.tagName === 'TEXTAREA' &&
+            (el.name === 'message' || el.id === 'custom-message') &&
+            isVisible(el)
+        );
+        if (findAnywhere(taPred)) return {state: 'textarea-ready'};
+
+        const btnPred = el => {
+            if (!isBtnish(el) || el.disabled) return false;
+            const combined = btnText(el);
+            if (!combined.includes('add a note')) return false;
+            return isVisible(el);
+        };
+        const btn = findAnywhere(btnPred);
+        if (!btn) return {state: 'add-note-missing'};
+        try { btn.scrollIntoView({block: 'center'}); } catch (e) {}
+        btn.click();
+        return {state: 'clicked',
+                text: (btn.innerText || '').trim().slice(0, 60),
+                aria: (btn.getAttribute('aria-label') || '').slice(0, 60)};
+    """
+
+    try:
+        result = driver.execute_script(click_add_note_js) or {}
+    except Exception as e:  # noqa: BLE001
+        print(f"      ⚠️  Add-a-note JS error: {e}")
+        result = {}
+
+    state = result.get('state')
+    if state == 'add-note-missing':
+        print(f"  ⚠️  Could not find 'Add a note' button for {name}.")
+        _dump_modal_diagnostics(driver, name, "add-note-missing")
         return False
+    if state == 'textarea-ready':
+        print(f"      ℹ️  Textarea already mounted — skipping Add-a-note step.")
+    elif state == 'clicked':
+        print(
+            f"      ✓ Clicked Add a note (text={result.get('text')!r}, "
+            f"aria={result.get('aria')!r}). Waiting for textarea..."
+        )
+        time.sleep(1.5)
+    else:
+        print(f"  ⚠️  Unexpected Add-a-note result for {name}: {result!r}")
+        return False
+
+    # Step 2: type the note via React-compatible setter, then dispatch
+    # input/change events so React re-renders and enables the Send button.
+    # We poll up to 5s on the Python side for the textarea to mount.
+    type_note_js = js_helpers + """
+        const note = arguments[0];
+        const taPred = el => (
+            el.tagName === 'TEXTAREA' && (
+                el.name === 'message'
+                || el.id === 'custom-message'
+                || ((el.className || '').toString()
+                    .includes('connect-button-send-invite__custom-message'))
+            )
+        );
+        const ta = findAnywhere(taPred);
+        if (!ta) return {state: 'no-textarea'};
+        const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype, 'value'
+        ).set;
+        ta.focus();
+        setter.call(ta, '');
+        ta.dispatchEvent(new Event('input', {bubbles: true}));
+        setter.call(ta, note);
+        ta.dispatchEvent(new Event('input', {bubbles: true}));
+        ta.dispatchEvent(new Event('change', {bubbles: true}));
+        return {state: 'typed', length: ta.value.length};
+    """
+
+    type_result = {}
+    _t0 = time.time()
+    while time.time() - _t0 < 5:
+        try:
+            type_result = driver.execute_script(
+                type_note_js, personalized_note
+            ) or {}
+        except Exception as e:  # noqa: BLE001
+            print(f"      ⚠️  Type-note JS error: {e}")
+            type_result = {}
+        if type_result.get('state') == 'typed':
+            break
+        time.sleep(0.3)
+
+    if type_result.get('state') == 'no-textarea':
+        print(f"  ⚠️  Could not find note text area for {name}.")
+        _dump_modal_diagnostics(driver, name, "textarea-missing")
+        return False
+    if type_result.get('state') != 'typed':
+        print(f"  ⚠️  Type-note unexpected result for {name}: {type_result!r}")
+        return False
+    print(f"      ✓ Typed note ({type_result.get('length')} chars).")
+    time.sleep(0.8)
+
+    # Step 3: click Send.
+    click_send_js = js_helpers + """
+        const btnPred = el => {
+            if (!isBtnish(el) || el.disabled) return false;
+            const combined = btnText(el);
+            // Match the post-Add-a-note Send button. We deliberately do NOT
+            // match plain 'Send' on its own, since that could be a messaging
+            // panel button — Send buttons in the invite modal always have
+            // aria-label of 'Send invitation' or 'Send now'.
+            if (combined.includes('send invitation')
+                || combined.includes('send now')) {
+                return isVisible(el);
+            }
+            return false;
+        };
+        const btn = findAnywhere(btnPred);
+        if (!btn) return {state: 'no-send'};
+        try { btn.scrollIntoView({block: 'center'}); } catch (e) {}
+        btn.click();
+        return {state: 'sent',
+                text: (btn.innerText || '').trim().slice(0, 60),
+                aria: (btn.getAttribute('aria-label') || '').slice(0, 60)};
+    """
+
+    try:
+        send_result = driver.execute_script(click_send_js) or {}
+    except Exception as e:  # noqa: BLE001
+        print(f"      ⚠️  Send JS error: {e}")
+        send_result = {}
+
+    if send_result.get('state') != 'sent':
+        print(f"  ⚠️  Could not find Send button for {name}.")
+        _dump_modal_diagnostics(driver, name, "send-button-missing")
+        return False
+    print(
+        f"      ✓ Clicked Send (text={send_result.get('text')!r}, "
+        f"aria={send_result.get('aria')!r})."
+    )
+    time.sleep(1.5)
+    return True
 
 
 def send_connection_request(driver, button, name, note_template):
@@ -806,6 +1143,360 @@ def _find_action_bar(driver):
     return None, []
 
 
+def _find_connect_in_action_bar(driver, verbose=False):
+    """
+    Find a direct Connect control (button OR <a>) that lives inside the
+    profile's top action bar. Anchored via _find_action_bar() so we never
+    match the 'Invite <name> to connect' links in the 'More profiles for
+    you' sidebar (which were silently getting clicked before).
+    """
+    action_bar, _ = _find_action_bar(driver)
+    if action_bar is None:
+        if verbose:
+            print("      🔍 _find_connect_in_action_bar: no action bar found")
+        return None
+    candidates = action_bar.find_elements(
+        By.XPATH,
+        ".//*[(self::button or self::a) and ("
+        "@aria-label='Connect' "
+        "or (contains(@aria-label, 'Invite') "
+        "and contains(@aria-label, 'to connect')))]",
+    )
+    for cand in candidates:
+        try:
+            if cand.is_displayed():
+                if verbose:
+                    print(
+                        f"      🔍 Connect in action bar: "
+                        f"{_describe_button(cand)}"
+                    )
+                return cand
+        except StaleElementReferenceException:
+            continue
+    if verbose:
+        print(
+            f"      🔍 _find_connect_in_action_bar: action bar found but "
+            f"no direct Connect inside it ({len(candidates)} candidates)"
+        )
+    return None
+
+
+def _find_invite_iframe(driver):
+    """
+    Return the <iframe> that hosts LinkedIn's Connect modal, or None.
+
+    Newer LinkedIn UIs preload the invitation modal inside an iframe with
+    src='/preload/custom-invite/...' (or similar). The modal markup lives
+    in that iframe's document, so Selenium driver-level find_element calls
+    against the top-level page cannot see the Add-a-note button, textarea,
+    or Send button.
+    """
+    for f in driver.find_elements(By.TAG_NAME, "iframe"):
+        try:
+            src = (f.get_attribute("src") or "").lower()
+            if not src or src == "about:blank":
+                continue
+            if "/preload" in src or "invite" in src or "send-invite" in src:
+                return f
+        except StaleElementReferenceException:
+            continue
+    return None
+
+
+def _iframe_contains_invite_markers(driver, iframe):
+    """
+    Switch into the given iframe and check if it contains Add-a-note /
+    Send / textarea markers. Always switches back before returning.
+    """
+    try:
+        driver.switch_to.frame(iframe)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        has_modal = driver.execute_script("""
+            const btns = document.querySelectorAll(
+                'button, [role="button"], a[role="button"]'
+            );
+            for (const b of btns) {
+                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                const aria = ((b.getAttribute && b.getAttribute('aria-label')) || '').toLowerCase();
+                const combined = t + ' ' + aria;
+                if (combined.includes('add a note')
+                    || combined.includes('send without a note')
+                    || combined.includes('send invitation')
+                    || combined.includes('personalize invite')) {
+                    const r = b.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return true;
+                }
+            }
+            if (document.querySelector(
+                'textarea[name="message"], textarea#custom-message'
+            )) return true;
+            return false;
+        """)
+        return bool(has_modal)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            driver.switch_to.default_content()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _dump_modal_diagnostics(driver, name, label):
+    """
+    Print everything we can about the page state when a modal step fails.
+    Catches the two most common LinkedIn surprises:
+      - The Connect click navigated to a different URL (e.g. /preload/...)
+      - A dialog/modal IS in the DOM but is aria-hidden or off-screen
+    """
+    print(f"  🩺 [{label}] Diagnostic dump for {name}:")
+    try:
+        print(f"      • current_url: {driver.current_url}")
+    except Exception as e:  # noqa: BLE001
+        print(f"      • current_url: <error: {e}>")
+    try:
+        title = driver.title
+        print(f"      • title:       {title!r}")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        info = driver.execute_script("""
+            const out = {
+                dialogs: [], nativeDialogs: [], modals: [], testModals: [],
+                addNoteBtns: [], sendBtns: [], textareas: [],
+                topLevelOverlays: [], iframes: []
+            };
+            function describe(el) {
+                const r = el.getBoundingClientRect();
+                return {
+                    tag: el.tagName.toLowerCase(),
+                    id: el.id || '',
+                    role: el.getAttribute('role') || '',
+                    ariaHidden: el.getAttribute('aria-hidden') || '',
+                    ariaLabel: (el.getAttribute('aria-label') || '').slice(0, 80),
+                    ariaLabelledby: el.getAttribute('aria-labelledby') || '',
+                    dataTestModalId: el.getAttribute('data-test-modal-id') || '',
+                    dataTestModal: el.getAttribute('data-test-modal') || '',
+                    cls: (el.className && el.className.toString
+                          ? el.className.toString() : (el.className || '')).slice(0, 200),
+                    text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+                    visible: r.width > 0 && r.height > 0,
+                    rect: {x: Math.round(r.x), y: Math.round(r.y),
+                           w: Math.round(r.width), h: Math.round(r.height)},
+                };
+            }
+            document.querySelectorAll('[role="dialog"]').forEach(d =>
+                out.dialogs.push(describe(d)));
+            document.querySelectorAll('dialog').forEach(d =>
+                out.nativeDialogs.push(describe(d)));
+            document.querySelectorAll('.artdeco-modal').forEach(m =>
+                out.modals.push(describe(m)));
+            document.querySelectorAll(
+                '[data-test-modal], [data-test-modal-id]'
+            ).forEach(m => out.testModals.push(describe(m)));
+            document.querySelectorAll(
+                'button, [role="button"], a[role="button"]'
+            ).forEach(b => {
+                const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                const aria = ((b.getAttribute && b.getAttribute('aria-label')) || '').toLowerCase();
+                const combined = t + ' ' + aria;
+                const r = b.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return;
+                if (combined.includes('add a note') || combined.includes('personalize invite')) {
+                    out.addNoteBtns.push(describe(b));
+                }
+                if (combined.includes('send invitation')
+                    || combined.includes('send without a note')
+                    || combined === 'send') {
+                    out.sendBtns.push(describe(b));
+                }
+            });
+            document.querySelectorAll('textarea').forEach(t =>
+                out.textareas.push(describe(t)));
+            // Any visible large fixed-positioned element directly under <body>
+            // — modals are often portaled here.
+            Array.from(document.body.children).forEach(c => {
+                const r = c.getBoundingClientRect();
+                if (r.width >= 200 && r.height >= 100 && r.width > 0) {
+                    const cs = getComputedStyle(c);
+                    if (cs.position === 'fixed' || cs.position === 'absolute') {
+                        out.topLevelOverlays.push(describe(c));
+                    }
+                }
+            });
+            document.querySelectorAll('iframe').forEach(f => {
+                out.iframes.push({
+                    src: (f.getAttribute('src') || '').slice(0, 120),
+                    rect: f.getBoundingClientRect(),
+                });
+            });
+            return out;
+        """) or {}
+
+        def _print_group(label, items, max_items=6):
+            print(f"      • {label} count: {len(items)}")
+            for i, d in enumerate(items[:max_items]):
+                rect = d.get("rect", {})
+                print(
+                    f"          [{i}] tag={d.get('tag')!r} id={d.get('id')!r} "
+                    f"role={d.get('role')!r} aria-hidden={d.get('ariaHidden')!r} "
+                    f"data-test-modal-id={d.get('dataTestModalId')!r} "
+                    f"visible={d.get('visible')} rect={rect}"
+                )
+                if d.get("ariaLabel"):
+                    print(f"               aria-label={d.get('ariaLabel')!r}")
+                if d.get("text"):
+                    print(f"               text={d.get('text')!r}")
+                if d.get("cls"):
+                    print(f"               class={d.get('cls')!r}")
+
+        _print_group("[role=dialog]", info.get("dialogs", []))
+        _print_group("<dialog>", info.get("nativeDialogs", []))
+        _print_group(".artdeco-modal", info.get("modals", []))
+        _print_group("[data-test-modal*]", info.get("testModals", []))
+        _print_group("Buttons containing 'Add a note'", info.get("addNoteBtns", []))
+        _print_group("Buttons containing 'Send...'", info.get("sendBtns", []))
+        _print_group("<textarea>", info.get("textareas", []))
+        _print_group(
+            "Top-level fixed/absolute overlays (potential portal modals)",
+            info.get("topLevelOverlays", []),
+        )
+        iframes = info.get("iframes", [])
+        if iframes:
+            print(f"      • iframes: {len(iframes)}")
+            for i, f in enumerate(iframes[:4]):
+                print(f"          [{i}] src={f.get('src')!r}")
+    except Exception as e:  # noqa: BLE001
+        print(f"      • (dialog/modal probe failed: {e})")
+
+    # Now look INSIDE each plausible invite-iframe. The top-level scan above
+    # won't see anything in there, which was the root cause of every
+    # 'modal never appeared' failure on the current LinkedIn UI.
+    try:
+        iframes_to_probe = driver.find_elements(By.TAG_NAME, "iframe")
+    except Exception:  # noqa: BLE001
+        iframes_to_probe = []
+    for idx, f in enumerate(iframes_to_probe):
+        try:
+            src = (f.get_attribute("src") or "")
+        except Exception:  # noqa: BLE001
+            src = ""
+        # Probe EVERY iframe — LinkedIn sometimes dynamically writes the
+        # modal into an about:blank iframe, so we can't skip those.
+        print(f"      🔬 Probing iframe[{idx}] src={src[:120]!r} ...")
+        try:
+            driver.switch_to.frame(f)
+        except Exception as e:  # noqa: BLE001
+            print(f"           (could not switch in: {e})")
+            continue
+        try:
+            iframe_info = driver.execute_script("""
+                const out = {
+                    addNoteBtns: [], sendBtns: [], textareas: [],
+                    testModals: [], nativeDialogs: [], roleDialogs: [],
+                    artdecoModals: [],
+                    allButtons: 0,
+                    bodyTextSnippet: ''
+                };
+                function describe(el) {
+                    const r = el.getBoundingClientRect();
+                    return {
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || '',
+                        ariaLabel: (el.getAttribute('aria-label') || '').slice(0, 80),
+                        text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+                        visible: r.width > 0 && r.height > 0,
+                        rect: {x: Math.round(r.x), y: Math.round(r.y),
+                               w: Math.round(r.width), h: Math.round(r.height)},
+                    };
+                }
+                const btns = document.querySelectorAll(
+                    'button, [role="button"], a[role="button"]'
+                );
+                out.allButtons = btns.length;
+                btns.forEach(b => {
+                    const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+                    const aria = ((b.getAttribute && b.getAttribute('aria-label')) || '').toLowerCase();
+                    const combined = t + ' ' + aria;
+                    const r = b.getBoundingClientRect();
+                    // Report ALL relevant buttons, even if currently invisible —
+                    // we want to know if the modal is mounted but display:none'd.
+                    if (combined.includes('add a note') || combined.includes('personalize')) {
+                        out.addNoteBtns.push(describe(b));
+                    }
+                    if (combined.includes('send invitation')
+                        || combined.includes('send without a note')
+                        || combined === 'send') {
+                        out.sendBtns.push(describe(b));
+                    }
+                });
+                document.querySelectorAll('textarea').forEach(t =>
+                    out.textareas.push(describe(t)));
+                document.querySelectorAll(
+                    '[data-test-modal], [data-test-modal-id]'
+                ).forEach(d => out.testModals.push(describe(d)));
+                document.querySelectorAll('dialog').forEach(d =>
+                    out.nativeDialogs.push(describe(d)));
+                document.querySelectorAll('[role="dialog"]').forEach(d =>
+                    out.roleDialogs.push(describe(d)));
+                document.querySelectorAll('.artdeco-modal').forEach(d =>
+                    out.artdecoModals.push(describe(d)));
+                out.bodyTextSnippet = (document.body ? document.body.innerText : '').slice(0, 200);
+                return out;
+            """) or {}
+            print(
+                f"           buttons={iframe_info.get('allButtons', 0)}, "
+                f"role=dialog={len(iframe_info.get('roleDialogs', []))}, "
+                f".artdeco-modal={len(iframe_info.get('artdecoModals', []))}, "
+                f"<dialog>={len(iframe_info.get('nativeDialogs', []))}, "
+                f"[data-test-modal*]={len(iframe_info.get('testModals', []))}"
+            )
+            for grp_label, key in (
+                ("Add a note buttons", "addNoteBtns"),
+                ("Send buttons", "sendBtns"),
+                ("Textareas", "textareas"),
+                ("[data-test-modal*]", "testModals"),
+                ("<dialog>", "nativeDialogs"),
+                ("[role=dialog]", "roleDialogs"),
+                (".artdeco-modal", "artdecoModals"),
+            ):
+                items = iframe_info.get(key, [])
+                if items:
+                    print(f"           {grp_label}: {len(items)}")
+                    for j, it in enumerate(items[:4]):
+                        print(
+                            f"               [{j}] tag={it.get('tag')!r} "
+                            f"text={it.get('text')!r} "
+                            f"aria-label={it.get('ariaLabel')!r} "
+                            f"visible={it.get('visible')} rect={it.get('rect')}"
+                        )
+            snippet = iframe_info.get("bodyTextSnippet") or ""
+            if snippet.strip():
+                print(f"           body-text-preview: {snippet!r}")
+        except Exception as e:  # noqa: BLE001
+            print(f"           (iframe probe failed: {e})")
+        finally:
+            try:
+                driver.switch_to.default_content()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Save a full-page screenshot so we can eyeball what LinkedIn rendered.
+    try:
+        shot_dir = "/tmp/linkedin_debug"
+        os.makedirs(shot_dir, exist_ok=True)
+        safe_name = "".join(c if c.isalnum() else "_" for c in name)[:40]
+        path = os.path.join(
+            shot_dir, f"{int(time.time())}_{label}_{safe_name}.png"
+        )
+        driver.save_screenshot(path)
+        print(f"      • screenshot:  {path}")
+    except Exception as e:  # noqa: BLE001
+        print(f"      • (screenshot failed: {e})")
+
+
 def _find_more_button(driver, verbose=False):
     """Find the action-bar "More" button on a profile page.
 
@@ -922,28 +1613,40 @@ def _wait_for_open_dropdown(driver, timeout=6.0):
 
 
 def _find_connect_in_dropdown(driver):
-    """Find the 'Connect' item inside an open dropdown."""
+    """Find the 'Connect' item inside an open dropdown.
+
+    IMPORTANT: every strategy must scope its match to an actual dropdown
+    container — otherwise it'll match sidebar 'Invite X to connect' buttons
+    in the 'More profiles for you' section, which are always present on the
+    page and have NOTHING to do with the More menu we just opened.
+    """
+    # Anchor every search inside an *open* (not aria-hidden='true') dropdown
+    # or menu container.
+    open_menu = (
+        "//div[(@role='menu' or contains(@class, 'artdeco-dropdown__content')) "
+        "and not(@aria-hidden='true')]"
+    )
     strategies = (
-        # role=menuitem variants.
-        "//*[@role='menuitem' and (normalize-space()='Connect' "
+        # role=menuitem variants, scoped to an open menu.
+        open_menu + "//*[@role='menuitem' and (normalize-space()='Connect' "
         "or .//*[normalize-space()='Connect'])]",
-        "//*[@role='menuitem' and contains(., 'Connect') "
+        open_menu + "//*[@role='menuitem' and contains(., 'Connect') "
         "and not(contains(., 'Remove connection'))]",
-        # LinkedIn's dropdown item classes.
-        "//*[contains(@class, 'artdeco-dropdown__item') and contains(., 'Connect') "
-        "and not(contains(., 'Remove connection'))]",
-        "//*[contains(@class, 'dropdown__item') and contains(., 'Connect') "
-        "and not(contains(., 'Remove connection'))]",
-        # Inside an open menu container.
-        "//div[@role='menu']//*[normalize-space()='Connect']",
-        "//div[contains(@class, 'artdeco-dropdown__content')]"
-        "//*[normalize-space()='Connect']",
-        # Aria-label match (LinkedIn sometimes uses "Invite <Name> to connect").
-        "//*[contains(@aria-label, 'Invite') and contains(@aria-label, 'to connect')]",
-        # "Personalize invite" wording.
-        "//*[@role='menuitem' and contains(., 'Personalize invite')]",
-        "//div[contains(@class, 'artdeco-dropdown__content')]"
-        "//*[contains(., 'Personalize invite')]",
+        # LinkedIn's dropdown item classes, scoped to an open menu.
+        open_menu + "//*[contains(@class, 'artdeco-dropdown__item') "
+        "and contains(., 'Connect') and not(contains(., 'Remove connection'))]",
+        open_menu + "//*[contains(@class, 'dropdown__item') "
+        "and contains(., 'Connect') and not(contains(., 'Remove connection'))]",
+        # Plain text match, scoped to an open menu.
+        open_menu + "//*[normalize-space()='Connect']",
+        # Aria-label match — MUST be scoped to the open dropdown, otherwise
+        # it matches sidebar 'Invite <Name> to connect' buttons (which are
+        # always present on the page and unrelated to the More menu).
+        open_menu + "//*[contains(@aria-label, 'Invite') "
+        "and contains(@aria-label, 'to connect')]",
+        # "Personalize invite" wording, scoped.
+        open_menu + "//*[@role='menuitem' and contains(., 'Personalize invite')]",
+        open_menu + "//*[contains(., 'Personalize invite')]",
     )
     for xp in strategies:
         for cand in driver.find_elements(By.XPATH, xp):
@@ -1038,22 +1741,80 @@ def send_connection_via_profile(
         except Exception:  # noqa: BLE001
             pass
 
-        # 1) Try a direct Connect button in the action bar first.
+        # 1) Try a direct Connect control IN THE ACTION BAR ONLY.
+        # The previous version searched all of <main>, which silently matched
+        # 'Invite <other-person> to connect' links in the 'More profiles for
+        # you' sidebar — we'd click the wrong person's Connect, no modal
+        # would open, and the run would fail in confusing ways.
+        url_before_connect = driver.current_url
         connect_opened = False
-        try:
-            connect_btn = driver.find_element(
-                By.XPATH,
-                "//main//button[@aria-label='Connect' "
-                "or (contains(@aria-label, 'Invite') "
-                "and contains(@aria-label, 'to connect'))]",
+        connect_btn = _find_connect_in_action_bar(driver, verbose=True)
+        if connect_btn is not None:
+            tag = connect_btn.tag_name
+            aria = connect_btn.get_attribute("aria-label") or ""
+            print(
+                f"      → Direct Connect control found in action bar "
+                f"(<{tag}> aria-label={aria!r})."
             )
-            if connect_btn.is_displayed():
-                print(f"      → Direct Connect button found in action bar.")
-                if _click_with_fallback(driver, connect_btn):
-                    time.sleep(1.5)
-                    connect_opened = True
-        except NoSuchElementException:
-            pass
+            # Sanity check: if the aria-label names a DIFFERENT person than
+            # the one whose profile we're on, refuse to click — that's the
+            # exact bug we just fixed and we want a loud failure if it
+            # ever recurs.
+            if aria and "Invite " in aria and "to connect" in aria:
+                aria_target = aria.replace("Invite ", "").replace(
+                    " to connect", "").strip()
+                if (
+                    aria_target
+                    and name.lower() not in aria_target.lower()
+                    and aria_target.split()[0].lower() != name.lower()
+                ):
+                    print(
+                        f"      ⚠️  Action-bar Connect names a different "
+                        f"person ({aria_target!r}); falling back to More menu."
+                    )
+                    connect_btn = None
+        if connect_btn is not None:
+            tag = connect_btn.tag_name
+            # For <a> tags, the React click handler should preventDefault
+            # and open the modal — but if React isn't fully bound yet, the
+            # browser will navigate to the href instead. Strip the href
+            # temporarily so a normal click can only fire the JS handler.
+            if tag == "a":
+                try:
+                    driver.execute_script("""
+                        const a = arguments[0];
+                        a.dataset._origHref = a.getAttribute('href') || '';
+                        a.removeAttribute('href');
+                    """, connect_btn)
+                except Exception:  # noqa: BLE001
+                    pass
+            if _click_with_fallback(driver, connect_btn):
+                time.sleep(1.5)
+                connect_opened = True
+            # Restore href so subsequent runs / page interactions are clean.
+            if tag == "a":
+                try:
+                    driver.execute_script("""
+                        const a = arguments[0];
+                        if (a.dataset._origHref) {
+                            a.setAttribute('href', a.dataset._origHref);
+                            delete a.dataset._origHref;
+                        }
+                    """, connect_btn)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Detect if the click navigated us off the profile (means React
+            # didn't catch the click — we'll need to recover).
+            try:
+                url_after = driver.current_url
+            except Exception:  # noqa: BLE001
+                url_after = ""
+            if url_after and url_after != url_before_connect:
+                print(
+                    f"      ⚠️  URL changed after Connect click: "
+                    f"{url_before_connect!r} → {url_after!r}"
+                )
 
         # 2) Otherwise open the More menu and find Connect inside it.
         if not connect_opened:
@@ -1135,7 +1896,10 @@ def send_connection_via_profile(
             if not _click_with_fallback(driver, connect_item):
                 print(f"      ⚠️  Could not click 'Connect' menu item for {name}.")
                 return False
-            time.sleep(1.5)
+            # The dropdown's Connect item triggers the modal asynchronously.
+            # Give it a moment, then _fill_and_send_connect_modal's own poll
+            # will wait for the modal to actually appear.
+            time.sleep(2.5)
 
         success = _fill_and_send_connect_modal(driver, name, personalized_note)
         if not success:
@@ -1189,7 +1953,14 @@ def main():
     parser.add_argument(
         "--note",
         default=NOTE_TEMPLATE,
-        help="Note template. Use {name} as placeholder for the person's first name.",
+        help="Note template. Use {name} as placeholder for the person's first name "
+             "and {sender_name} for your own name.",
+    )
+    parser.add_argument(
+        "--name-on-note",
+        default=None,
+        metavar="NAME",
+        help="Your name as it should appear in the connection note (e.g. 'Nakul').",
     )
     parser.add_argument(
         "--max",
@@ -1272,6 +2043,14 @@ def main():
         help="Anthropic model the agent uses (default: claude-sonnet-4-0).",
     )
     args = parser.parse_args()
+
+    if not args.name_on_note:
+        args.name_on_note = input(
+            "⚠️  Who is sending these requests? Pass --name-on-note <NAME> "
+            "or enter it now: "
+        ).strip() or "there"
+
+    args.note = args.note.replace("{sender_name}", args.name_on_note)
 
     # --agent-only implies the agent; --via-profile-only implies via-profile.
     # If the user only set --max, treat it as a global cap that also raises
